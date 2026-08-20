@@ -1,29 +1,35 @@
 /* ============================================================
-   AirSmash — app.js
-   Camera hand-tracked air table tennis. Your hand is the paddle.
+   AirSmash — app.js  (3D first-person table tennis)
+   Your hand is the paddle. Camera behind your end of the table,
+   full view of the net, the opponent and the arena.
 
    Sections (banner-commented, top to bottom):
-     1. Constants        — geometry, physics tuning, difficulty table
+     1. Constants        — table dimensions, physics, difficulty
      2. State            — single mutable state object
      3. DOM refs         — cacheDom()
-     4. Layout           — canvas sizing + table geometry
+     4. Layout           — renderer/camera sizing
      5. Persistence      — localStorage save/load
      6. Screen flow      — showScreen(), overlays
      7. Camera & tracking— getUserMedia + MediaPipe HandLandmarker
-     8. Hand input       — mirror, map, smooth, velocity, hand-lost
-     9. Match flow       — reset, serve, score, win
-    10. Physics          — ball step, wall + paddle collisions
-    11. AI               — difficulty-scaled opponent
-    12. Rendering        — single render pass (canvas + HUD sync)
-    13. Banner / Toast
-    14. Sound            — lazy WebAudio blips
-    15. Confetti
-    16. Wiring           — buttons + keyboard
-    17. Main loop
-    18. Test seam        — window.__airsmash (used by verify/capture)
+     8. Hand input       — mirror, map to 3D paddle, swing velocity
+     9. 3D scene         — arena, table, net, paddles, ball (Three.js)
+    10. Match flow       — reset, serve, score, win
+    11. Shot solver      — ballistic aim with net clearance
+    12. Ball physics     — gravity, table bounce, net, out of bounds
+    13. Player hitting   — swing detection + returns
+    14. AI opponent      — prediction, movement, returns, serves
+    15. Rendering        — render pass, PiP preview, HUD sync
+    16. Banner / Toast
+    17. Sound            — lazy WebAudio blips
+    18. Confetti
+    19. Wiring           — buttons + keyboard
+    20. Main loop
+    21. Test seam        — window.__airsmash (used by verify/capture)
    ============================================================ */
 
 'use strict';
+
+import * as THREE from 'three';
 
 /* ============================================================
    1. CONSTANTS
@@ -38,36 +44,49 @@ const MP_BUNDLE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER
 const MP_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
 // Hand → paddle mapping (normalized camera coords, AFTER mirroring).
-const HAND_X_MIN = 0.08, HAND_X_MAX = 0.92;   // full table width
-const HAND_Y_MIN = 0.30, HAND_Y_MAX = 0.95;   // player's half only
-const SMOOTH_RATE = 18;                        // exp-filter rate (per second)
+const HAND_X_MIN = 0.10, HAND_X_MAX = 0.90;
+const HAND_Y_MIN = 0.25, HAND_Y_MAX = 0.90;
+const SMOOTH_RATE = 16;                        // exp-filter rate (per second)
 const HAND_LOST_MS = 500;                      // grace before "show your hand"
 
-// Ball physics (px/sec unless noted).
-const BALL_R = 9;
-const BALL_SPEED_BASE = 430;
-const BALL_SPEED_MAX = 980;
-const BALL_SPEEDUP = 1.035;                    // per paddle hit
-const WALL_DAMP = 1.0;                         // walls keep speed
-const SPIN_FACTOR = 0.30;                      // hand velocity → ball vx
-const PADDLE_V_CLAMP = 1500;                   // max paddle velocity fed to spin
-const KEY_SPEED = 720;                         // keyboard fallback px/sec
+// Paddle workspace (world meters, player's near side).
+const PADDLE_X_RANGE = 1.05;
+const PADDLE_Y_TOP = 1.62, PADDLE_Y_BOT = 0.82;
+const PADDLE_Z = 1.05;
+const PADDLE_REACH = 0.32;                     // hit radius around the paddle
 
-// Paddles.
-const PADDLE_W = 118, PADDLE_H = 20, PADDLE_R = 10;
+// Table (ITTF proportions, in meters). z: -far … +near (player at +z).
+const TABLE = {
+  W: 1.525, L: 2.74, H: 0.76,
+  NET_H: 0.1525, NET_W: 1.72,
+};
+const HALF_W = TABLE.W / 2;
+const HALF_L = TABLE.L / 2;
+const NET_TOP = TABLE.H + TABLE.NET_H;
+
+// Ball physics.
+const BALL_R = 0.045;                          // slightly oversized for visibility
+const GRAVITY = 12.0;                          // snappier than real gravity
+const RESTITUTION = 0.72;                      // table bounce
+const FLOOR_RESTITUTION = 0.45;
+
+// Serving.
+const SERVE_SPEED = 2.6;
+const AUTO_SERVE_S = 4.5;                      // your serve auto-launches after this
+const AI_SERVE_DELAY = 1.3;
 
 // Match rules.
 const WIN_SCORE = 11;
 const WIN_BY = 2;
 const SCORE_CAP = 15;                          // sudden death beyond this
 const COUNTDOWN_STEP = 0.6;                    // seconds per countdown number
-const BANNER_TIME = 1.15;                      // point banner duration
+const POINT_TIME = 1.35;                       // banner time between points
 
-// Difficulty table: AI max speed, reaction delay, aim error, targeting.
+// Difficulty table: AI paddle speed, reaction delay, aim error (m), targeting.
 const DIFFICULTY = {
-  easy:   { label: 'Easy',   speed: 300, react: 0.22, error: 95, aimAway: false },
-  normal: { label: 'Normal', speed: 430, react: 0.14, error: 55, aimAway: false },
-  hard:   { label: 'Hard',   speed: 580, react: 0.08, error: 26, aimAway: true  },
+  easy:   { label: 'Easy',   speed: 1.15, react: 0.24, error: 0.50, aimAway: false, returnSpeed: 2.3 },
+  normal: { label: 'Normal', speed: 1.75, react: 0.15, error: 0.28, aimAway: false, returnSpeed: 2.7 },
+  hard:   { label: 'Hard',   speed: 2.45, react: 0.08, error: 0.13, aimAway: true,  returnSpeed: 3.1 },
 };
 
 // Hand skeleton connections (MediaPipe landmark indices).
@@ -81,6 +100,8 @@ const HAND_CONNECTIONS = [
 ];
 const PALM_IDX = [0, 5, 9, 13, 17];            // stable palm centroid
 
+const KEY_SPEED = 1.7;                         // keyboard fallback m/s
+
 const TEST_MODE = new URLSearchParams(location.search).has('test');
 const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -90,7 +111,7 @@ const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const state = {
   screen: 'intro',           // intro | setup | error | play
-  phase: 'idle',             // idle | serve | rally | point | over
+  phase: 'idle',             // idle | countdown | serve | rally | point | over
   paused: false,
   difficulty: 'normal',
   inputMode: 'hand',         // hand | keyboard
@@ -101,16 +122,24 @@ const state = {
   rally: 0,
   longestRally: 0,
   serveSide: 'you',          // you | ai
-  timer: 0,                  // phase countdown timer
-  lastCountdown: -1,         // last countdown number shown in banner
+  serveTimer: 0,
+  timer: 0,                  // countdown / point-phase timer
+  lastCountdown: -1,
   lastPointWinner: null,
 
   // Ball
-  ball: { x: 0, y: 0, vx: 0, vy: 0, speed: BALL_SPEED_BASE, trail: [] },
+  ball: {
+    x: 0, y: 1.0, z: 0.8,
+    vx: 0, vy: 0, vz: 0,
+    lastHitter: null,        // you | ai
+    bounces: 0,              // bounces since last hit
+    validOpponentBounce: false,
+    visible: true,
+  },
 
-  // Paddles (positions set by layout)
-  player: { x: 0, y: 0, vx: 0, targetX: 0, targetY: 0 },
-  ai: { x: 0, y: 0, vx: 0, targetX: 0, aimX: 0, aimErr: 0, reactT: 0 },
+  // Paddles (world positions)
+  player: { x: 0, y: 1.1, z: PADDLE_Z, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.1, hitCooldown: 0 },
+  ai: { x: 0, y: 1.0, z: -1.15, vx: 0, targetX: 0, targetY: 1.0, hitCooldown: 0, reactT: 0, aimErrX: 0, aimErrZ: 0 },
 
   // Hand tracking
   hand: {
@@ -133,7 +162,7 @@ const state = {
   stats: { wins: 0, losses: 0, bestRally: 0 },
 };
 
-const keys = { left: false, right: false, up: false, down: false };
+const keys = { left: false, right: false, up: false, down: false, swing: 0 };
 
 /* ============================================================
    3. DOM REFS
@@ -143,7 +172,7 @@ const el = {};
 
 function cacheDom() {
   const ids = [
-    'camera', 'game', 'confetti', 'hud', 'score-you', 'score-ai',
+    'camera', 'game', 'preview', 'confetti', 'hud', 'score-you', 'score-ai',
     'rally-count', 'serve-chip', 'btn-sound', 'btn-pause',
     'banner', 'banner-text', 'banner-sub', 'hand-hint',
     'screen-intro', 'screen-setup', 'screen-error',
@@ -165,49 +194,22 @@ function cacheDom() {
    ============================================================ */
 
 const view = { w: 0, h: 0, dpr: 1 };
-const table = { x: 0, y: 0, w: 0, h: 0, netY: 0, bottomY: 0 };
 
 function layout() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
   view.w = window.innerWidth;
   view.h = window.innerHeight;
-  view.dpr = dpr;
-
-  for (const [canvas] of [[el.game], [el.confetti]]) {
-    canvas.width = Math.round(view.w * dpr);
-    canvas.height = Math.round(view.h * dpr);
+  view.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (world.renderer) {
+    world.renderer.setPixelRatio(view.dpr);
+    world.renderer.setSize(view.w, view.h);
+    world.camera.aspect = view.w / view.h;
+    // Widen FOV on portrait screens so the whole table stays visible.
+    world.camera.fov = view.w / view.h < 0.8 ? 72 : 58;
+    world.camera.updateProjectionMatrix();
   }
-
-  // Table: portrait → limited by width; landscape → limited by height.
-  const topPad = 64, bottomPad = 26, sidePad = 18;
-  const availW = view.w - sidePad * 2;
-  const availH = view.h - topPad - bottomPad;
-
-  let tw = Math.min(availW, 560);
-  let th = tw * 1.42;
-  if (th > availH) { th = availH; tw = th / 1.42; }
-  tw = Math.max(tw, 220); th = Math.max(th, 300);
-
-  table.w = tw;
-  table.h = th;
-  table.x = (view.w - tw) / 2;
-  table.y = topPad + (availH - th) / 2;
-  table.netY = table.y + th / 2;
-  table.bottomY = table.y + th;
-
-  // Paddle rails.
-  state.player.y = table.bottomY - 34;
-  state.ai.y = table.y + 34;
-  clampPaddles();
-}
-
-function clampPaddles() {
-  const half = PADDLE_W / 2;
-  const lo = table.x + half + 4, hi = table.x + table.w - half - 4;
-  state.player.x = Math.min(hi, Math.max(lo, state.player.x || table.x + table.w / 2));
-  state.ai.x = Math.min(hi, Math.max(lo, state.ai.x || table.x + table.w / 2));
-  state.player.targetX = Math.min(hi, Math.max(lo, state.player.targetX));
-  state.player.targetY = Math.min(table.bottomY - 14, Math.max(table.netY + 26, state.player.targetY || state.player.y));
+  const cc = el.confetti;
+  cc.width = Math.round(view.w * view.dpr);
+  cc.height = Math.round(view.h * view.dpr);
 }
 
 /* ============================================================
@@ -251,6 +253,11 @@ function showScreen(name) {
   el['overlay-pause'].classList.toggle('hidden', !(name === 'play' && state.paused));
   el['overlay-gameover'].classList.toggle('hidden', !(name === 'play' && state.phase === 'over'));
   el.hud.classList.toggle('hidden', name !== 'play');
+
+  const showPreview = state.inputMode === 'hand' && (name === 'setup' || name === 'play');
+  el.preview.classList.toggle('hidden', !showPreview);
+  el.preview.classList.toggle('in-play', name === 'play');
+
   if (name !== 'play') {
     el['hand-hint'].classList.add('hidden');
     el.banner.classList.add('hidden');
@@ -439,7 +446,7 @@ function detectFrame(nowMs) {
 }
 
 /* ============================================================
-   8. HAND INPUT → PADDLE
+   8. HAND INPUT → 3D PADDLE
    ============================================================ */
 
 function updateHandInput(dt) {
@@ -452,12 +459,11 @@ function updateHandInput(dt) {
     hand.smX += (hand.rawX - hand.smX) * a;
     hand.smY += (hand.rawY - hand.smY) * a;
 
-    // Map normalized hand position onto the player's half of the table.
+    // Map normalized hand position into the 3D paddle workspace.
     const nx = (hand.smX - HAND_X_MIN) / (HAND_X_MAX - HAND_X_MIN);
     const ny = (hand.smY - HAND_Y_MIN) / (HAND_Y_MAX - HAND_Y_MIN);
-    const half = PADDLE_W / 2;
-    state.player.targetX = table.x + Math.min(1.06, Math.max(-0.06, nx)) * table.w;
-    state.player.targetY = table.netY + 26 + Math.min(1, Math.max(0, ny)) * (table.bottomY - 14 - (table.netY + 26));
+    state.player.targetX = (Math.min(1.12, Math.max(-1.12, nx * 2 - 1))) * PADDLE_X_RANGE;
+    state.player.targetY = PADDLE_Y_TOP - Math.min(1, Math.max(0, ny)) * (PADDLE_Y_TOP - PADDLE_Y_BOT);
     el['hand-hint'].classList.add('hidden');
   } else {
     hand.lostMs += dt * 1000;
@@ -475,29 +481,321 @@ function updateKeyboardInput(dt) {
   const dx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
   const dy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
   p.targetX = p.x + dx * KEY_SPEED * dt;
-  p.targetY = p.y + dy * KEY_SPEED * dt;
+  p.targetY = p.y - dy * KEY_SPEED * dt;
   el['hand-hint'].classList.add('hidden');
   movePlayerPaddle(dt);
 }
 
 function movePlayerPaddle(dt) {
   const p = state.player;
-  const half = PADDLE_W / 2;
-  const lo = table.x + half + 4, hi = table.x + table.w - half - 4;
-  const tx = Math.min(hi, Math.max(lo, p.targetX));
-  const ty = Math.min(table.bottomY - 14, Math.max(table.netY + 26, p.targetY));
+  const tx = Math.min(PADDLE_X_RANGE, Math.max(-PADDLE_X_RANGE, p.targetX));
+  const ty = Math.min(PADDLE_Y_TOP, Math.max(PADDLE_Y_BOT, p.targetY));
 
-  const prevX = p.x;
-  const a = 1 - Math.exp(-dt * 26);
+  const prevX = p.x, prevY = p.y;
+  const a = 1 - Math.exp(-dt * 24);
   p.x += (tx - p.x) * a;
   p.y += (ty - p.y) * a;
 
-  let vx = dt > 0 ? (p.x - prevX) / dt : 0;
-  p.vx = Math.min(PADDLE_V_CLAMP, Math.max(-PADDLE_V_CLAMP, vx));
+  // Swing velocity (used for spin, power and serve detection).
+  if (dt > 0) {
+    const ivx = (p.x - prevX) / dt;
+    const ivy = (p.y - prevY) / dt;
+    p.vx += (ivx - p.vx) * Math.min(1, dt * 20);
+    p.vy += (ivy - p.vy) * Math.min(1, dt * 20);
+  }
+  let kb = 0;
+  if (keys.swing > 0) { kb = 2.6; keys.swing = Math.max(0, keys.swing - dt * 6); }
+  p.speed = Math.max(Math.hypot(p.vx, p.vy), kb);
+
+  // Gentle forward lunge while swinging fast (visual only).
+  p.z = PADDLE_Z - Math.min(0.18, p.speed * 0.045);
 }
 
 /* ============================================================
-   9. MATCH FLOW
+   9. 3D SCENE
+   ============================================================ */
+
+const world = {
+  renderer: null, scene: null, camera: null,
+  ball: null, ballShadow: null, trail: [],
+  playerPaddle: null, aiPaddle: null, opponent: null,
+};
+
+function initThree() {
+  world.renderer = new THREE.WebGLRenderer({ canvas: el.game, antialias: true });
+  world.renderer.shadowMap.enabled = true;
+  world.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  world.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  world.renderer.toneMappingExposure = 1.12;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x070b16);
+  scene.fog = new THREE.Fog(0x070b16, 9, 22);
+  world.scene = scene;
+
+  world.camera = new THREE.PerspectiveCamera(58, 1, 0.1, 60);
+  world.camera.position.set(0, 1.72, 2.35);
+  world.camera.lookAt(0, 0.78, -0.55);
+
+  buildArena(scene);
+  buildTable(scene);
+  buildBall(scene);
+  world.playerPaddle = buildPaddle(scene, 0xe23b4e, true);
+  world.aiPaddle = buildPaddle(scene, 0x1c1c22, false);
+  buildOpponent(scene);
+}
+
+function buildArena(scene) {
+  // Floor
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(11, 48),
+    new THREE.MeshStandardMaterial({ color: 0x0b1020, roughness: 0.95, metalness: 0 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // Subtle floor grid
+  const grid = new THREE.GridHelper(22, 44, 0x1c2a4a, 0x111a30);
+  grid.position.y = 0.005;
+  grid.material.transparent = true;
+  grid.material.opacity = 0.5;
+  scene.add(grid);
+
+  // Glow ring around the table
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(2.15, 2.32, 64),
+    new THREE.MeshBasicMaterial({ color: 0x4dd7ff, transparent: true, opacity: 0.28, side: THREE.DoubleSide })
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.012;
+  scene.add(ring);
+
+  // Back wall + neon strips
+  const wall = new THREE.Mesh(
+    new THREE.PlaneGeometry(24, 6),
+    new THREE.MeshStandardMaterial({ color: 0x0d1426, roughness: 1 })
+  );
+  wall.position.set(0, 3, -7);
+  scene.add(wall);
+
+  const stripGeo = new THREE.BoxGeometry(9, 0.07, 0.05);
+  const stripCyan = new THREE.Mesh(stripGeo, new THREE.MeshBasicMaterial({ color: 0x4dd7ff }));
+  stripCyan.position.set(-4.5, 2.6, -6.95);
+  scene.add(stripCyan);
+  const stripPink = new THREE.Mesh(stripGeo, new THREE.MeshBasicMaterial({ color: 0xff5d73 }));
+  stripPink.position.set(4.5, 2.2, -6.95);
+  scene.add(stripPink);
+  const stripGreen = new THREE.Mesh(new THREE.BoxGeometry(5, 0.05, 0.05), new THREE.MeshBasicMaterial({ color: 0x35e08c }));
+  stripGreen.position.set(0, 3.6, -6.95);
+  scene.add(stripGreen);
+
+  // Side barrier boards (like real TT surrounds)
+  const boardMat = new THREE.MeshStandardMaterial({ color: 0x101a30, roughness: 0.9 });
+  for (const side of [-1, 1]) {
+    const board = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.55, 5.2), boardMat);
+    board.position.set(side * 2.6, 0.275, 0);
+    scene.add(board);
+  }
+  const farBoard = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.55, 0.04), boardMat);
+  farBoard.position.set(0, 0.275, -3.1);
+  scene.add(farBoard);
+
+  // Lights
+  scene.add(new THREE.HemisphereLight(0x8fb4ff, 0x1a1420, 0.85));
+
+  const key = new THREE.DirectionalLight(0xfff2dd, 1.7);
+  key.position.set(2.5, 5.5, 3.5);
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.camera.left = -3; key.shadow.camera.right = 3;
+  key.shadow.camera.top = 3; key.shadow.camera.bottom = -3;
+  key.shadow.camera.near = 1; key.shadow.camera.far = 12;
+  scene.add(key);
+
+  const cyan = new THREE.PointLight(0x4dd7ff, 18, 9);
+  cyan.position.set(-3, 2.4, -2.5);
+  scene.add(cyan);
+  const pink = new THREE.PointLight(0xff5d73, 16, 9);
+  pink.position.set(3, 2.4, 2.5);
+  scene.add(pink);
+}
+
+function buildTable(scene) {
+  const group = new THREE.Group();
+
+  // Playing surface (top at TABLE.H)
+  const top = new THREE.Mesh(
+    new THREE.BoxGeometry(TABLE.W, 0.04, TABLE.L),
+    new THREE.MeshStandardMaterial({ color: 0x1a4fa0, roughness: 0.35, metalness: 0.05 })
+  );
+  top.position.y = TABLE.H - 0.02;
+  top.receiveShadow = true;
+  group.add(top);
+
+  // White boundary lines (edges of the surface)
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(TABLE.W, 0.001, TABLE.L)),
+    new THREE.LineBasicMaterial({ color: 0xeef3ff })
+  );
+  edges.position.y = TABLE.H + 0.002;
+  group.add(edges);
+
+  // Center line (lengthwise)
+  const centerLine = new THREE.Mesh(
+    new THREE.BoxGeometry(0.012, 0.002, TABLE.L),
+    new THREE.MeshBasicMaterial({ color: 0xeef3ff })
+  );
+  centerLine.position.y = TABLE.H + 0.002;
+  group.add(centerLine);
+
+  // Apron under the surface
+  const apron = new THREE.Mesh(
+    new THREE.BoxGeometry(TABLE.W - 0.08, 0.09, TABLE.L - 0.12),
+    new THREE.MeshStandardMaterial({ color: 0x0e1526, roughness: 0.8 })
+  );
+  apron.position.y = TABLE.H - 0.085;
+  group.add(apron);
+
+  // Legs
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x22262e, roughness: 0.5, metalness: 0.6 });
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.06, TABLE.H - 0.06, 0.06), legMat);
+    leg.position.set(sx * 0.62, (TABLE.H - 0.06) / 2, sz * 1.1);
+    leg.castShadow = true;
+    group.add(leg);
+  }
+
+  // Net assembly
+  const net = new THREE.Mesh(
+    new THREE.BoxGeometry(TABLE.NET_W, TABLE.NET_H - 0.012, 0.008),
+    new THREE.MeshStandardMaterial({ color: 0x9aa7c0, transparent: true, opacity: 0.75, roughness: 0.9 })
+  );
+  net.position.set(0, TABLE.H + (TABLE.NET_H - 0.012) / 2, 0);
+  group.add(net);
+
+  const netTop = new THREE.Mesh(
+    new THREE.BoxGeometry(TABLE.NET_W, 0.012, 0.01),
+    new THREE.MeshBasicMaterial({ color: 0xeef3ff })
+  );
+  netTop.position.set(0, NET_TOP - 0.006, 0);
+  group.add(netTop);
+
+  const postMat = new THREE.MeshStandardMaterial({ color: 0x2a3040, roughness: 0.4, metalness: 0.7 });
+  for (const sx of [-1, 1]) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, TABLE.NET_H + 0.02, 10), postMat);
+    post.position.set(sx * (TABLE.NET_W / 2), TABLE.H + TABLE.NET_H / 2, 0);
+    group.add(post);
+  }
+
+  scene.add(group);
+}
+
+function buildBall(scene) {
+  const ball = new THREE.Mesh(
+    new THREE.SphereGeometry(BALL_R, 24, 16),
+    new THREE.MeshStandardMaterial({
+      color: 0xfff6e0, emissive: 0x775511, emissiveIntensity: 0.35, roughness: 0.4,
+    })
+  );
+  ball.castShadow = true;
+  scene.add(ball);
+  world.ball = ball;
+
+  // Soft shadow blob projected on the table/floor.
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(0.055, 20),
+    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.35 })
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  scene.add(shadow);
+  world.ballShadow = shadow;
+
+  // Trail
+  for (let i = 0; i < 10; i++) {
+    const t = new THREE.Mesh(
+      new THREE.SphereGeometry(BALL_R * (0.28 + i * 0.05), 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0x9fdcff, transparent: true, opacity: 0.05 + i * 0.02 })
+    );
+    t.visible = false;
+    scene.add(t);
+    world.trail.push(t);
+  }
+}
+
+function buildPaddle(scene, rubberColor, isPlayer) {
+  const group = new THREE.Group();
+
+  // Blade (axis along z so the flat faces point down-table)
+  const blade = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.105, 0.105, 0.014, 28),
+    new THREE.MeshStandardMaterial({ color: 0xd8c9a8, roughness: 0.7 })
+  );
+  blade.rotation.x = Math.PI / 2;
+  blade.castShadow = true;
+  group.add(blade);
+
+  // Rubber faces
+  const rubberNear = new THREE.Mesh(
+    new THREE.CircleGeometry(0.105, 28),
+    new THREE.MeshStandardMaterial({ color: rubberColor, roughness: 0.85 })
+  );
+  rubberNear.position.z = 0.0085;
+  group.add(rubberNear);
+  const rubberFar = new THREE.Mesh(
+    new THREE.CircleGeometry(0.105, 28),
+    new THREE.MeshStandardMaterial({ color: isPlayer ? 0x1c1c22 : 0xe23b4e, roughness: 0.85 })
+  );
+  rubberFar.position.z = -0.0085;
+  rubberFar.rotation.y = Math.PI;
+  group.add(rubberFar);
+
+  // Handle
+  const handle = new THREE.Mesh(
+    new THREE.BoxGeometry(0.034, 0.115, 0.022),
+    new THREE.MeshStandardMaterial({ color: 0xc9a06a, roughness: 0.75 })
+  );
+  handle.position.y = -0.155;
+  handle.castShadow = true;
+  group.add(handle);
+
+  scene.add(group);
+  return group;
+}
+
+function buildOpponent(scene) {
+  const group = new THREE.Group();
+
+  const torso = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.17, 0.52, 6, 14),
+    new THREE.MeshStandardMaterial({ color: 0x232a3f, roughness: 0.85 })
+  );
+  torso.position.y = 1.28;
+  torso.castShadow = true;
+  group.add(torso);
+
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.11, 18, 14),
+    new THREE.MeshStandardMaterial({ color: 0x2e3648, roughness: 0.8 })
+  );
+  head.position.y = 1.72;
+  group.add(head);
+
+  // Glowing visor so the opponent reads as "AI"
+  const visor = new THREE.Mesh(
+    new THREE.BoxGeometry(0.14, 0.022, 0.02),
+    new THREE.MeshBasicMaterial({ color: 0xff5d73 })
+  );
+  visor.position.set(0, 1.73, 0.1);
+  group.add(visor);
+
+  group.position.set(0, 0, -2.05);
+  scene.add(group);
+  world.opponent = group;
+}
+
+/* ============================================================
+   10. MATCH FLOW
    ============================================================ */
 
 function resetMatch() {
@@ -509,17 +807,19 @@ function resetMatch() {
   state.lastPointWinner = null;
   state.paused = false;
   state.phase = 'idle';      // clears any 'over' so overlays re-evaluate
-  state.ball.trail.length = 0;
-  state.ai.aimErr = 0;
+  state.ai.aimErrX = 0;
+  state.ai.aimErrZ = 0;
   state.ai.reactT = 0;
-  state.ai.x = table.x + table.w / 2;
-  state.ai.targetX = state.ai.x;
+  state.ai.x = 0; state.ai.targetX = 0;
+  state.ai.y = 1.0; state.ai.targetY = 1.0;
 }
 
 function startMatch() {
   resetMatch();
   showScreen('play');
-  startServe();
+  state.phase = 'countdown';
+  state.timer = COUNTDOWN_STEP * 3;
+  state.lastCountdown = -1;
 }
 
 function currentServer() {
@@ -531,51 +831,55 @@ function currentServer() {
   return block === 0 ? 'you' : 'ai';
 }
 
-function startServe() {
+function beginServe() {
   state.phase = 'serve';
-  state.timer = COUNTDOWN_STEP * 3;
-  state.lastCountdown = -1;
+  state.serveTimer = 0;
   state.rally = 0;
   state.serveSide = currentServer();
-  state.ball.speed = BALL_SPEED_BASE;
-  state.ball.trail.length = 0;
-  state.ball.vx = 0; state.ball.vy = 0;
-  placeBallForServe();
+  const b = state.ball;
+  b.vx = b.vy = b.vz = 0;
+  b.lastHitter = null;
+  b.bounces = 0;
+  b.validOpponentBounce = false;
+  b.visible = true;
   updateServeChip();
-}
-
-function placeBallForServe() {
-  const b = state.ball;
   if (state.serveSide === 'you') {
-    b.x = state.player.x;
-    b.y = state.player.y - PADDLE_H / 2 - BALL_R - 6;
+    showBanner('Your serve', 'Swipe through the ball to launch it');
   } else {
-    b.x = state.ai.x;
-    b.y = state.ai.y + PADDLE_H / 2 + BALL_R + 6;
+    showBanner('AI serve', 'Get ready…');
   }
 }
 
-function launchBall() {
+function launchPlayerServe() {
   const b = state.ball;
-  b.speed = BALL_SPEED_BASE;
-  if (state.serveSide === 'you') {
-    const ang = (-90 + (Math.random() * 44 - 22)) * Math.PI / 180;   // upward
-    b.vx = Math.cos(ang) * b.speed;
-    b.vy = Math.sin(ang) * b.speed;
-  } else {
-    // AI serves toward a random spot on the player's side.
-    const targetX = table.x + table.w * (0.2 + Math.random() * 0.6);
-    const targetY = table.netY + (table.bottomY - table.netY) * 0.6;
-    const T = (targetY - b.y) / b.speed;
-    b.vx = (targetX - b.x) / T;
-    b.vy = b.speed;
-    const mag = Math.hypot(b.vx, b.vy);
-    b.vx = b.vx / mag * b.speed;
-    b.vy = b.vy / mag * b.speed;
-  }
+  const p = state.player;
+  const power = Math.min(3.5, 2.2 + p.speed * 0.35);
+  const aimX = clampNum(p.vx * 0.14 + (Math.random() - 0.5) * 0.35, -0.62, 0.62);
+  const v = solveShot({ x: b.x, y: b.y, z: b.z }, { x: aimX, y: TABLE.H + BALL_R, z: -(0.45 + Math.random() * 0.7) }, power);
+  b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
+  b.lastHitter = 'you';
+  b.bounces = 0;
+  b.validOpponentBounce = false;
   state.phase = 'rally';
+  state.rally = 1;
   hideBanner();
-  blip(520, 0.06, 'triangle', 0.05);
+  hitSound(power);
+}
+
+function launchAiServe() {
+  const b = state.ball;
+  const cfg = DIFFICULTY[state.difficulty];
+  const aimX = (Math.random() - 0.5) * 1.0;
+  const v = solveShot({ x: b.x, y: b.y, z: b.z },
+    { x: aimX, y: TABLE.H + BALL_R, z: 0.5 + Math.random() * 0.7 }, cfg.returnSpeed - 0.3);
+  b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
+  b.lastHitter = 'ai';
+  b.bounces = 0;
+  b.validOpponentBounce = false;
+  state.phase = 'rally';
+  state.rally = 1;
+  hideBanner();
+  hitSound(cfg.returnSpeed);
 }
 
 function scorePoint(winner) {
@@ -584,7 +888,7 @@ function scorePoint(winner) {
   if (winner === 'you') state.scoreYou++; else state.scoreAI++;
   state.lastPointWinner = winner;
   state.phase = 'point';
-  state.timer = BANNER_TIME;
+  state.timer = POINT_TIME;
 
   if (winner === 'you') {
     showBanner('Your point!', `${state.scoreYou} : ${state.scoreAI}`, 'you');
@@ -604,7 +908,7 @@ function afterPoint() {
   const won = (you >= WIN_SCORE || ai >= WIN_SCORE) && lead >= WIN_BY;
   const capped = you >= SCORE_CAP || ai >= SCORE_CAP;
   if (won || capped) { endMatch(you > ai ? 'you' : 'ai'); return; }
-  startServe();
+  beginServe();
 }
 
 function endMatch(winner) {
@@ -636,86 +940,165 @@ function updateServeChip() {
   el['serve-chip'].textContent = state.serveSide === 'you' ? 'Your serve' : 'AI serve';
 }
 
+function clampNum(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
 /* ============================================================
-   10. PHYSICS
+   11. SHOT SOLVER — ballistic aim with net clearance
    ============================================================ */
 
-function stepPhysics(dt) {
+// Returns the initial velocity that lands the ball at `to`, given launch speed.
+// y(t) = y0 + vy·t − ½·G·t²  →  vy = (dy + ½·G·T²) / T
+function solveShot(from, to, speed) {
+  const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+  const dist = Math.hypot(dx, dz);
+  let T = clampNum(dist / speed, 0.42, 1.7);
+
+  let vx = 0, vy = 0, vz = 0;
+  for (let i = 0; i < 4; i++) {
+    vx = dx / T; vz = dz / T;
+    vy = (dy + 0.5 * GRAVITY * T * T) / T;
+    // Check net clearance: height where the trajectory crosses z = 0.
+    if (Math.abs(vz) > 0.001) {
+      const tNet = (0 - from.z) / vz;
+      if (tNet > 0 && tNet < T) {
+        const yNet = from.y + vy * tNet - 0.5 * GRAVITY * tNet * tNet;
+        if (yNet < NET_TOP + 0.045) { T *= 1.3; continue; }   // lob higher
+      }
+    }
+    break;
+  }
+  return { vx, vy, vz };
+}
+
+/* ============================================================
+   12. BALL PHYSICS
+   ============================================================ */
+
+function stepBall(dt, scoring) {
   const b = state.ball;
+  if (!b.visible) return;
 
-  // Trail.
-  b.trail.push({ x: b.x, y: b.y });
-  if (b.trail.length > 10) b.trail.shift();
-
-  // Substep so a fast ball can't tunnel through a paddle.
-  const steps = Math.max(1, Math.ceil((Math.abs(b.vx) + Math.abs(b.vy)) * dt / (BALL_R * 0.9)));
+  const speed = Math.hypot(b.vx, b.vy, b.vz);
+  const steps = Math.max(1, Math.ceil(speed * dt / (BALL_R * 0.8)));
   const sdt = dt / steps;
 
   for (let i = 0; i < steps; i++) {
-    const prevY = b.y;
+    const prevZ = b.z;
+
+    b.vy -= GRAVITY * sdt;
     b.x += b.vx * sdt;
     b.y += b.vy * sdt;
+    b.z += b.vz * sdt;
 
-    // Side walls.
-    const left = table.x + BALL_R, right = table.x + table.w - BALL_R;
-    if (b.x < left) { b.x = left + (left - b.x); b.vx = Math.abs(b.vx) * WALL_DAMP; wallTick(); }
-    else if (b.x > right) { b.x = right - (b.x - right); b.vx = -Math.abs(b.vx) * WALL_DAMP; wallTick(); }
-
-    // Player paddle (ball moving down, crossing the paddle face).
-    if (b.vy > 0) {
-      const face = state.player.y - PADDLE_H / 2 - BALL_R;
-      if (prevY <= face && b.y >= face && Math.abs(b.x - state.player.x) <= PADDLE_W / 2 + BALL_R * 0.6) {
-        paddleHit(state.player, -1);
+    // --- Net collision (crossing z=0 below net top, within net width) ---
+    if (Math.sign(prevZ) !== Math.sign(b.z) && Math.abs(b.x) < TABLE.NET_W / 2) {
+      const tCross = Math.abs(prevZ) / (Math.abs(prevZ) + Math.abs(b.z) || 1);
+      const yCross = b.y - b.vy * sdt * (1 - tCross);
+      if (yCross < NET_TOP && yCross > TABLE.H - 0.05) {
+        // Hit the net: dribble back toward the side it came from.
+        b.z = Math.sign(prevZ) * 0.02;
+        b.vz = -b.vz * 0.16;
+        b.vy *= 0.55;
+        b.vx *= 0.7;
+        blip(110, 0.08, 'sawtooth', 0.04);
       }
     }
 
-    // AI paddle (ball moving up).
-    if (b.vy < 0) {
-      const face = state.ai.y + PADDLE_H / 2 + BALL_R;
-      if (prevY >= face && b.y <= face && Math.abs(b.x - state.ai.x) <= PADDLE_W / 2 + BALL_R * 0.6) {
-        paddleHit(state.ai, 1);
+    // --- Table bounce ---
+    if (b.vy < 0 && b.y <= TABLE.H + BALL_R && b.y > TABLE.H - 0.12 &&
+        Math.abs(b.x) <= HALF_W && Math.abs(b.z) <= HALF_L) {
+      b.y = TABLE.H + BALL_R;
+      b.vy = -b.vy * RESTITUTION;
+      b.vx *= 0.96;
+      b.vz *= 0.96;
+      blip(175, 0.045, 'sine', 0.055);
+
+      if (scoring && b.lastHitter) {
+        const side = b.z > 0 ? 'near' : 'far';
+        const ownSide = (b.lastHitter === 'you' && side === 'near') || (b.lastHitter === 'ai' && side === 'far');
+        if (ownSide && b.bounces === 0 && !b.validOpponentBounce) {
+          // Never crossed the net — fault.
+          scorePoint(b.lastHitter === 'you' ? 'ai' : 'you');
+          return;
+        }
+        b.bounces++;
+        if (b.bounces === 1 && !ownSide) b.validOpponentBounce = true;
+        if (b.bounces >= 2) {
+          // Receiver failed to return it.
+          scorePoint(b.lastHitter);
+          return;
+        }
       }
     }
 
-    // Endlines → point.
-    if (b.y < table.y - BALL_R * 2.5) { scorePoint('you'); return; }
-    if (b.y > table.bottomY + BALL_R * 2.5) { scorePoint('ai'); return; }
+    // --- Floor ---
+    if (b.y < BALL_R) {
+      b.y = BALL_R;
+      if (Math.abs(b.vy) > 0.4) {
+        b.vy = -b.vy * FLOOR_RESTITUTION;
+        b.vx *= 0.8; b.vz *= 0.8;
+        blip(120, 0.04, 'sine', 0.03);
+      } else {
+        b.vy = 0; b.vx *= 0.9; b.vz *= 0.9;
+      }
+      if (scoring && b.lastHitter) {
+        // Touched the floor: resolve the point.
+        scorePoint(b.validOpponentBounce ? b.lastHitter : (b.lastHitter === 'you' ? 'ai' : 'you'));
+        return;
+      }
+    }
+
+    // --- Out of the arena ---
+    if (Math.abs(b.z) > 3.4 || Math.abs(b.x) > 3.0) {
+      if (scoring && b.lastHitter) {
+        scorePoint(b.validOpponentBounce ? b.lastHitter : (b.lastHitter === 'you' ? 'ai' : 'you'));
+        return;
+      }
+      b.visible = false;
+      return;
+    }
   }
 }
 
-function paddleHit(paddle, dirY) {
+/* ============================================================
+   13. PLAYER HITTING
+   ============================================================ */
+
+function stepPlayerHit(dt) {
+  const p = state.player;
+  p.hitCooldown = Math.max(0, p.hitCooldown - dt);
   const b = state.ball;
-  b.speed = Math.min(BALL_SPEED_MAX, b.speed * BALL_SPEEDUP);
+
+  if (state.phase !== 'rally' || b.lastHitter === 'you' || p.hitCooldown > 0) return;
+  if (b.z < 0.22) return;                              // must be on your side of the net
+
+  const dist = Math.hypot(b.x - p.x, b.y - p.y, b.z - p.z);
+  if (dist > PADDLE_REACH) return;
+
+  // Contact! Aim the return using swing direction + a little randomness.
+  const swing = Math.min(4, p.speed);
+  const speed = clampNum(2.3 + state.rally * 0.08 + swing * 0.45, 2.3, 6.2);
+  const aimX = clampNum(p.vx * 0.16 + (Math.random() - 0.5) * 0.3, -0.68, 0.68);
+  const aimZ = -(0.45 + Math.random() * 0.8);
+  const v = solveShot({ x: b.x, y: b.y, z: b.z }, { x: aimX, y: TABLE.H + BALL_R, z: aimZ }, speed);
+  b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
+  b.lastHitter = 'you';
+  b.bounces = 0;
+  b.validOpponentBounce = false;
   state.rally++;
-
-  // Angle from hit position on the paddle face (−1 … 1).
-  const hit = Math.min(1, Math.max(-1, (b.x - paddle.x) / (PADDLE_W / 2)));
-  const maxAng = 62 * Math.PI / 180;
-  let vx = Math.sin(hit * maxAng) * b.speed;
-
-  // Spin from paddle (hand) velocity at contact.
-  vx += paddle.vx * SPIN_FACTOR * 0.5;
-  const maxVx = Math.sin(maxAng) * b.speed * 1.15;
-  vx = Math.min(maxVx, Math.max(-maxVx, vx));
-
-  b.vx = vx;
-  b.vy = dirY * Math.sqrt(Math.max(b.speed * b.speed - vx * vx, (b.speed * 0.45) ** 2));
-
-  // Reposition just outside the face.
-  if (dirY < 0) b.y = state.player.y - PADDLE_H / 2 - BALL_R - 0.5;
-  else b.y = state.ai.y + PADDLE_H / 2 + BALL_R + 0.5;
-
-  const pitch = 300 + (b.speed / BALL_SPEED_MAX) * 380;
-  blip(pitch, 0.045, 'square', 0.05);
+  p.hitCooldown = 0.3;
+  state.ai.reactT = DIFFICULTY[state.difficulty].react;
+  state.ai.aimErrX = 0; state.ai.aimErrZ = 0;
+  hitSound(speed);
   if (navigator.vibrate) { try { navigator.vibrate(12); } catch { /* ignore */ } }
 }
 
-function wallTick() {
-  blip(210, 0.03, 'square', 0.028);
+function hitSound(speed) {
+  blip(300 + speed * 70, 0.05, 'square', 0.055);
 }
 
 /* ============================================================
-   11. AI
+   14. AI OPPONENT
    ============================================================ */
 
 function stepAI(dt) {
@@ -723,266 +1106,189 @@ function stepAI(dt) {
   const ai = state.ai;
   const b = state.ball;
 
-  ai.reactT -= dt;
+  ai.hitCooldown = Math.max(0, ai.hitCooldown - dt);
+  ai.reactT = Math.max(0, ai.reactT - dt);
 
-  if (state.phase === 'rally' && b.vy < 0) {
-    // Ball incoming: predict landing x at the AI rail (with reaction delay).
-    if (ai.reactT <= 0) {
-      const t = (b.y - (ai.y + PADDLE_H / 2)) / -b.vy;
-      let predX = b.x + b.vx * Math.max(0, t);
-      // Reflect prediction off the walls.
-      const lo = table.x + BALL_R, hi = table.x + table.w - BALL_R, span = hi - lo;
-      if (span > 0) {
-        let rel = (predX - lo) % (2 * span);
-        if (rel < 0) rel += 2 * span;
-        predX = rel <= span ? lo + rel : lo + (2 * span - rel);
-      }
-      if (ai.aimErr === 0) {
-        ai.aimErr = (Math.random() * 2 - 1) * cfg.error;
-        if (cfg.aimAway) {
-          // Hard: bias the return away from the player's current position.
-          const away = state.player.x < table.x + table.w / 2 ? 1 : -1;
-          ai.aimErr += away * cfg.error * 0.9;
-        }
-      }
-      ai.targetX = predX + ai.aimErr;
-      ai.reactT = cfg.react;
+  const incoming = state.phase === 'rally' && b.lastHitter === 'you' && b.vz < 0 && b.visible;
+
+  if (incoming && ai.reactT <= 0) {
+    // Predict where the ball arrives at the AI's rail (z = -1.15).
+    const tArr = (b.z - ai.z) / -b.vz;
+    if (tArr > 0 && tArr < 2.2) {
+      let predX = b.x + b.vx * tArr;
+      let predY = b.y + b.vy * tArr - 0.5 * GRAVITY * tArr * tArr;
+      // If it arrives below the table, aim for the post-bounce rise instead.
+      if (predY < TABLE.H + 0.05) predY = TABLE.H + 0.12;
+      ai.targetX = clampNum(predX, -PADDLE_X_RANGE, PADDLE_X_RANGE);
+      ai.targetY = clampNum(predY, 0.86, 1.5);
+    } else {
+      ai.targetX = 0; ai.targetY = 1.0;
     }
-  } else {
-    // Drift back toward center between shots.
-    ai.targetX = table.x + table.w / 2 + (b.x - table.x - table.w / 2) * 0.15;
-    ai.aimErr = 0;
+  } else if (!incoming) {
+    // Drift toward center, shading toward the ball's x.
+    ai.targetX = clampNum(b.x * 0.2, -0.5, 0.5);
+    ai.targetY = 1.0;
   }
 
-  const half = PADDLE_W / 2;
-  const lo = table.x + half + 4, hi = table.x + table.w - half - 4;
-  const target = Math.min(hi, Math.max(lo, ai.targetX));
-  const dx = target - ai.x;
-  const maxStep = cfg.speed * dt;
-  const prevX = ai.x;
-  ai.x += Math.min(maxStep, Math.max(-maxStep, dx));
-  ai.vx = dt > 0 ? Math.min(PADDLE_V_CLAMP, Math.max(-PADDLE_V_CLAMP, (ai.x - prevX) / dt)) : 0;
+  // Move at capped speed.
+  const dx = ai.targetX - ai.x;
+  const dy = ai.targetY - ai.y;
+  const dLen = Math.hypot(dx, dy);
+  if (dLen > 0.001) {
+    const step = Math.min(dLen, cfg.speed * dt);
+    const prevX = ai.x;
+    ai.x += dx / dLen * step;
+    ai.y += dy / dLen * step;
+    ai.vx = dt > 0 ? (ai.x - prevX) / dt : 0;
+  }
+
+  // Attempt a return.
+  if (incoming && ai.hitCooldown <= 0 && b.z < -0.28) {
+    const dist = Math.hypot(b.x - ai.x, b.y - ai.y, b.z - ai.z);
+    if (dist <= PADDLE_REACH + 0.04) {
+      aiReturn();
+    }
+  }
+}
+
+function aiReturn() {
+  const cfg = DIFFICULTY[state.difficulty];
+  const ai = state.ai;
+  const b = state.ball;
+
+  // Pick a target on the player's half; Hard aims away from the player.
+  let aimX = (Math.random() - 0.5) * 1.1;
+  if (cfg.aimAway) aimX = state.player.x < 0 ? 0.5 : -0.5;
+  // Per-shot aim error (can push the shot wide/long → your point).
+  if (ai.aimErrX === 0 && ai.aimErrZ === 0) {
+    ai.aimErrX = (Math.random() * 2 - 1) * cfg.error;
+    ai.aimErrZ = (Math.random() * 2 - 1) * cfg.error * 0.8;
+  }
+  const target = {
+    x: clampNum(aimX + ai.aimErrX, -1.05, 1.05),
+    y: TABLE.H + BALL_R,
+    z: clampNum(0.5 + Math.random() * 0.72 + ai.aimErrZ, 0.25, 1.6),
+  };
+
+  const speed = clampNum(cfg.returnSpeed + state.rally * 0.06 + Math.random() * 0.4, 2.0, 5.6);
+  const v = solveShot({ x: b.x, y: b.y, z: b.z }, target, speed);
+  b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
+  b.lastHitter = 'ai';
+  b.bounces = 0;
+  b.validOpponentBounce = false;
+  state.rally++;
+  ai.hitCooldown = 0.3;
+  hitSound(speed);
 }
 
 /* ============================================================
-   12. RENDERING — single pass, canvas + HUD sync
+   15. RENDERING — Three.js pass, PiP preview, HUD sync
    ============================================================ */
 
-let ctx = null, confettiCtx = null;
+let previewCtx = null;
+let confettiCtx = null;
+const trailPts = [];
 
-function render() {
-  const c = ctx;
-  c.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+function renderScene(dt) {
+  const p = state.player;
+  const b = state.ball;
 
-  drawBackground(c);
-  drawTable(c);
-  if (state.inputMode === 'hand' && (state.screen === 'setup' || state.screen === 'play')) {
-    drawSkeleton(c);
+  // Player paddle follows the smoothed targets; tilt with the swing.
+  const pp = world.playerPaddle;
+  pp.position.set(p.x, p.y, p.z);
+  pp.rotation.z = clampNum(-p.vx * 0.05, -0.5, 0.5);
+  pp.rotation.x = 0.12 + clampNum(p.vy * 0.04, -0.35, 0.35);
+
+  // AI paddle.
+  const ap = world.aiPaddle;
+  ap.position.set(state.ai.x, state.ai.y, state.ai.z);
+  ap.rotation.z = clampNum(state.ai.vx * 0.04, -0.4, 0.4);
+
+  // Opponent leans toward the ball.
+  if (world.opponent) {
+    world.opponent.position.x += (clampNum(b.x * 0.3, -0.7, 0.7) - world.opponent.position.x) * Math.min(1, dt * 4);
+    world.opponent.position.y = Math.sin(performance.now() * 0.0016) * 0.02;
   }
-  if (state.screen === 'play' && (state.phase === 'serve' || state.phase === 'rally' || state.phase === 'point')) {
-    drawBall(c);
+
+  // Ball + shadow + trail.
+  world.ball.visible = b.visible;
+  world.ball.position.set(b.x, b.y, b.z);
+  world.ball.rotation.x += dt * 6;
+
+  const overTable = Math.abs(b.x) <= HALF_W + 0.2 && Math.abs(b.z) <= HALF_L + 0.2 && b.y > TABLE.H;
+  const shadowY = overTable ? TABLE.H + 0.004 : 0.006;
+  const h = Math.max(0.05, b.y - shadowY);
+  world.ballShadow.visible = b.visible;
+  world.ballShadow.position.set(b.x, shadowY, b.z);
+  const sScale = clampNum(1.6 - h * 0.55, 0.4, 1.6);
+  world.ballShadow.scale.set(sScale, sScale, sScale);
+  world.ballShadow.material.opacity = clampNum(0.42 - h * 0.16, 0.06, 0.42);
+
+  if (b.visible && state.phase === 'rally') {
+    trailPts.push({ x: b.x, y: b.y, z: b.z });
+    if (trailPts.length > 10) trailPts.shift();
+  } else if (trailPts.length) {
+    trailPts.length = 0;
   }
-  if (state.screen === 'play' || state.screen === 'setup') {
-    drawPaddles(c);
+  for (let i = 0; i < world.trail.length; i++) {
+    const t = world.trail[i];
+    const pt = trailPts[trailPts.length - 1 - i];
+    if (pt) { t.visible = true; t.position.set(pt.x, pt.y, pt.z); }
+    else t.visible = false;
   }
-  syncHud();
+
+  // Subtle camera sway with the paddle.
+  world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
+  world.camera.lookAt(0, 0.78, -0.55);
+
+  world.renderer.render(world.scene, world.camera);
 }
 
-function drawBackground(c) {
-  c.fillStyle = '#070b16';
-  c.fillRect(0, 0, view.w, view.h);
+// Picture-in-picture camera preview with hand skeleton.
+function drawPreview() {
+  const pc = previewCtx;
+  const W = el.preview.width, H = el.preview.height;
+  pc.fillStyle = '#05070d';
+  pc.fillRect(0, 0, W, H);
 
-  // Test-mode simulated camera feed (used by capture.js for honest screenshots).
   const feed = TEST_MODE ? state.fakeBackground : null;
   const liveVideo = !TEST_MODE && video && video.readyState >= 2 && video.videoWidth ? video : null;
 
-  if (state.inputMode === 'hand' && (feed || liveVideo)) {
-    // Mirrored camera feed, dimmed, behind everything.
+  if (feed || liveVideo) {
     const src = feed || liveVideo;
     const sw = feed ? feed.width : liveVideo.videoWidth;
     const sh = feed ? feed.height : liveVideo.videoHeight;
-    c.save();
-    c.translate(view.w, 0);
-    c.scale(-1, 1);
-    c.globalAlpha = 0.5;
-    const s = Math.max(view.w / sw, view.h / sh);
-    const dw = sw * s, dh = sh * s;
-    c.drawImage(src, (view.w - dw) / 2, (view.h - dh) / 2, dw, dh);
-    c.restore();
-    c.globalAlpha = 1;
-    c.fillStyle = 'rgba(7, 11, 22, 0.62)';
-    c.fillRect(0, 0, view.w, view.h);
+    pc.save();
+    pc.translate(W, 0);
+    pc.scale(-1, 1);                       // mirrored, like a mirror
+    const s = Math.max(W / sw, H / sh);
+    pc.drawImage(src, (W - sw * s) / 2, (H - sh * s) / 2, sw * s, sh * s);
+    pc.restore();
+
+    const lm = state.hand.landmarks;
+    if (lm) {
+      pc.strokeStyle = 'rgba(77, 215, 255, 0.85)';
+      pc.lineWidth = 2;
+      pc.lineCap = 'round';
+      for (const [a, bIdx] of HAND_CONNECTIONS) {
+        pc.beginPath();
+        pc.moveTo((1 - lm[a].x) * W, lm[a].y * H);
+        pc.lineTo((1 - lm[bIdx].x) * W, lm[bIdx].y * H);
+        pc.stroke();
+      }
+      pc.fillStyle = 'rgba(77, 215, 255, 0.95)';
+      for (const pt of lm) {
+        pc.beginPath();
+        pc.arc((1 - pt.x) * W, pt.y * H, 3, 0, Math.PI * 2);
+        pc.fill();
+      }
+    }
   } else {
-    // Ambient arena glow when no camera feed is shown.
-    const g = c.createRadialGradient(view.w / 2, view.h * 0.15, 40, view.w / 2, view.h * 0.15, view.h);
-    g.addColorStop(0, 'rgba(53, 224, 140, 0.07)');
-    g.addColorStop(1, 'rgba(7, 11, 22, 0)');
-    c.fillStyle = g;
-    c.fillRect(0, 0, view.w, view.h);
+    pc.fillStyle = '#9fb0d0';
+    pc.font = '600 13px Inter, sans-serif';
+    pc.textAlign = 'center';
+    pc.fillText('camera warming up…', W / 2, H / 2);
   }
-}
-
-function drawTable(c) {
-  const { x, y, w, h } = table;
-
-  // Table surface (slightly translucent so the camera ghosts through).
-  const g = c.createLinearGradient(0, y, 0, y + h);
-  g.addColorStop(0, 'rgba(23, 52, 108, 0.94)');
-  g.addColorStop(0.5, 'rgba(17, 40, 88, 0.94)');
-  g.addColorStop(1, 'rgba(23, 52, 108, 0.94)');
-  c.fillStyle = g;
-  roundRect(c, x, y, w, h, 14);
-  c.fill();
-
-  // Outer glow.
-  c.save();
-  c.shadowColor = 'rgba(77, 215, 255, 0.28)';
-  c.shadowBlur = 26;
-  c.strokeStyle = 'rgba(238, 243, 255, 0.85)';
-  c.lineWidth = 3;
-  roundRect(c, x, y, w, h, 14);
-  c.stroke();
-  c.restore();
-
-  // Boundary lines.
-  c.strokeStyle = 'rgba(238, 243, 255, 0.55)';
-  c.lineWidth = 2;
-  roundRect(c, x + 8, y + 8, w - 16, h - 16, 8);
-  c.stroke();
-
-  // Center line (lengthwise, like a real table).
-  c.strokeStyle = 'rgba(238, 243, 255, 0.22)';
-  c.lineWidth = 2;
-  c.setLineDash([10, 12]);
-  c.beginPath();
-  c.moveTo(x + w / 2, y + 10);
-  c.lineTo(x + w / 2, y + h - 10);
-  c.stroke();
-  c.setLineDash([]);
-
-  // Net band.
-  const netG = c.createLinearGradient(x, 0, x + w, 0);
-  netG.addColorStop(0, 'rgba(238, 243, 255, 0.10)');
-  netG.addColorStop(0.5, 'rgba(238, 243, 255, 0.30)');
-  netG.addColorStop(1, 'rgba(238, 243, 255, 0.10)');
-  c.fillStyle = netG;
-  c.fillRect(x - 6, table.netY - 3, w + 12, 6);
-  c.fillStyle = 'rgba(238, 243, 255, 0.8)';
-  c.fillRect(x - 6, table.netY - 3, 6, 6);
-  c.fillRect(x + w, table.netY - 3, 6, 6);
-}
-
-function drawSkeleton(c) {
-  const lm = state.hand.landmarks;
-  if (!lm) {
-    if (state.fakeHand && state.screen === 'setup') drawFakeHandMarker(c);
-    return;
-  }
-  const px = (p) => ({ x: (1 - p.x) * view.w, y: p.y * view.h });   // mirrored
-  c.save();
-  c.strokeStyle = 'rgba(77, 215, 255, 0.45)';
-  c.lineWidth = 2.5;
-  c.lineCap = 'round';
-  for (const [a, b] of HAND_CONNECTIONS) {
-    const pa = px(lm[a]), pb = px(lm[b]);
-    c.beginPath();
-    c.moveTo(pa.x, pa.y);
-    c.lineTo(pb.x, pb.y);
-    c.stroke();
-  }
-  c.fillStyle = 'rgba(77, 215, 255, 0.7)';
-  for (const p of lm) {
-    const q = px(p);
-    c.beginPath();
-    c.arc(q.x, q.y, 3.5, 0, Math.PI * 2);
-    c.fill();
-  }
-  c.restore();
-}
-
-function drawFakeHandMarker(c) {
-  // Test-mode setup preview: a soft marker where the fake hand sits.
-  const x = state.fakeHand.x * view.w;
-  const y = state.fakeHand.y * view.h;
-  c.save();
-  c.strokeStyle = 'rgba(77, 215, 255, 0.6)';
-  c.lineWidth = 2;
-  c.beginPath();
-  c.arc(x, y, 26, 0, Math.PI * 2);
-  c.stroke();
-  c.beginPath();
-  c.arc(x, y, 5, 0, Math.PI * 2);
-  c.fillStyle = 'rgba(77, 215, 255, 0.8)';
-  c.fill();
-  c.restore();
-}
-
-function drawBall(c) {
-  const b = state.ball;
-
-  // Trail.
-  for (let i = 0; i < b.trail.length; i++) {
-    const t = b.trail[i];
-    const f = (i + 1) / b.trail.length;
-    c.globalAlpha = f * 0.22;
-    c.fillStyle = '#4dd7ff';
-    c.beginPath();
-    c.arc(t.x, t.y, BALL_R * (0.4 + f * 0.55), 0, Math.PI * 2);
-    c.fill();
-  }
-  c.globalAlpha = 1;
-
-  // Shadow.
-  c.fillStyle = 'rgba(0, 0, 0, 0.3)';
-  c.beginPath();
-  c.ellipse(b.x + 4, b.y + 6, BALL_R * 0.9, BALL_R * 0.55, 0, 0, Math.PI * 2);
-  c.fill();
-
-  // Ball with glow.
-  c.save();
-  c.shadowColor = 'rgba(255, 255, 255, 0.75)';
-  c.shadowBlur = 16;
-  const g = c.createRadialGradient(b.x - 3, b.y - 3, 1, b.x, b.y, BALL_R);
-  g.addColorStop(0, '#ffffff');
-  g.addColorStop(1, '#ffd166');
-  c.fillStyle = g;
-  c.beginPath();
-  c.arc(b.x, b.y, BALL_R, 0, Math.PI * 2);
-  c.fill();
-  c.restore();
-}
-
-function drawPaddles(c) {
-  if (state.screen === 'play' || (state.screen === 'setup' && state.hand.everDetected)) {
-    drawPaddle(c, state.player.x, state.player.y, '#35e08c', 'rgba(53, 224, 140, 0.5)');
-  }
-  if (state.screen === 'play') {
-    drawPaddle(c, state.ai.x, state.ai.y, '#ff5d73', 'rgba(255, 93, 115, 0.5)');
-  }
-}
-
-function drawPaddle(c, x, y, color, glow) {
-  c.save();
-  c.shadowColor = glow;
-  c.shadowBlur = 20;
-  const g = c.createLinearGradient(x - PADDLE_W / 2, y, x + PADDLE_W / 2, y);
-  g.addColorStop(0, color);
-  g.addColorStop(0.5, '#eef3ff');
-  g.addColorStop(1, color);
-  c.fillStyle = g;
-  roundRect(c, x - PADDLE_W / 2, y - PADDLE_H / 2, PADDLE_W, PADDLE_H, PADDLE_R);
-  c.fill();
-  c.restore();
-}
-
-function roundRect(c, x, y, w, h, r) {
-  c.beginPath();
-  c.moveTo(x + r, y);
-  c.arcTo(x + w, y, x + w, y + h, r);
-  c.arcTo(x + w, y + h, x, y + h, r);
-  c.arcTo(x, y + h, x, y, r);
-  c.arcTo(x, y, x + w, y, r);
-  c.closePath();
 }
 
 // HUD sync — cheap, only writes when values changed.
@@ -1002,7 +1308,7 @@ function setHud(id, text) {
 }
 
 /* ============================================================
-   13. BANNER / TOAST
+   16. BANNER / TOAST
    ============================================================ */
 
 let bannerTimeout = null;
@@ -1033,7 +1339,7 @@ function toast(msg) {
 }
 
 /* ============================================================
-   14. SOUND — lazy WebAudio, never breaks gameplay
+   17. SOUND — lazy WebAudio, never breaks gameplay
    ============================================================ */
 
 let audioCtx = null;
@@ -1077,7 +1383,7 @@ function toggleSound() {
 }
 
 /* ============================================================
-   15. CONFETTI
+   18. CONFETTI
    ============================================================ */
 
 let confettiParts = [];
@@ -1126,7 +1432,7 @@ function stepConfetti(dt) {
 }
 
 /* ============================================================
-   16. WIRING
+   19. WIRING
    ============================================================ */
 
 function setDifficulty(diff) {
@@ -1151,14 +1457,16 @@ function togglePause(force) {
     hideBanner();
     blip(300, 0.06, 'sine', 0.04);
   } else {
-    if (state.phase === 'serve') state.lastCountdown = -1;   // redraw countdown banner
+    if (state.phase === 'serve' && state.serveSide === 'you') {
+      showBanner('Your serve', 'Swipe through the ball to launch it');
+    }
     blip(500, 0.06, 'sine', 0.04);
   }
 }
 
 function startKeyboardMode() {
   state.inputMode = 'keyboard';
-  toast('Keyboard mode — arrow keys move the paddle');
+  toast('Keyboard mode — arrows move, Space swings');
   startMatch();
 }
 
@@ -1199,6 +1507,7 @@ function wireControls() {
     else if (k === 'ArrowRight' || k === 'd') { keys.right = true; e.preventDefault(); }
     else if (k === 'ArrowUp' || k === 'w') { keys.up = true; e.preventDefault(); }
     else if (k === 'ArrowDown' || k === 's') { keys.down = true; e.preventDefault(); }
+    else if (k === ' ') { keys.swing = 1; e.preventDefault(); }
     else if (k === 'p' || k === 'P' || k === 'Escape') togglePause();
   });
   window.addEventListener('keyup', (e) => {
@@ -1223,7 +1532,7 @@ function wireControls() {
 }
 
 /* ============================================================
-   17. MAIN LOOP
+   20. MAIN LOOP
    ============================================================ */
 
 let lastTs = 0;
@@ -1231,27 +1540,51 @@ let lastTs = 0;
 function update(dt, nowMs) {
   detectFrame(nowMs);
 
+  // Paddle follows the hand on the setup screen too (live preview).
+  if (state.screen === 'setup') {
+    if (state.inputMode === 'hand') updateHandInput(dt);
+    return;
+  }
   if (state.screen !== 'play' || state.paused) return;
 
   if (state.inputMode === 'hand') updateHandInput(dt);
   else updateKeyboardInput(dt);
 
-  if (state.phase === 'serve') {
-    placeBallForServe();      // ball rides the server's paddle during countdown
-    stepAI(dt);
+  if (state.phase === 'countdown') {
     state.timer -= dt;
     const n = Math.max(1, Math.ceil(state.timer / COUNTDOWN_STEP));
     if (n !== state.lastCountdown) {
       state.lastCountdown = n;
-      showBanner(String(n), state.serveSide === 'you' ? 'Your serve — get ready' : 'AI serving…');
+      showBanner(String(n), 'First to 11 — win by 2');
       blip(440, 0.05, 'sine', 0.045);
     }
-    if (state.timer <= 0) launchBall();
+    if (state.timer <= 0) beginServe();
+  } else if (state.phase === 'serve') {
+    state.serveTimer += dt;
+    const b = state.ball;
+    if (state.serveSide === 'you') {
+      // Ball floats beside your paddle until you swipe it.
+      b.x = state.player.x - 0.13;
+      b.y = state.player.y + 0.06;
+      b.z = state.player.z - 0.2;
+      b.visible = true;
+      if (state.player.speed > 1.15 || state.serveTimer > AUTO_SERVE_S) launchPlayerServe();
+    } else {
+      // AI holds the ball, then serves.
+      b.x = state.ai.x + 0.12;
+      b.y = state.ai.y + 0.06;
+      b.z = state.ai.z + 0.18;
+      b.visible = true;
+      stepAI(dt);
+      if (state.serveTimer > AI_SERVE_DELAY) launchAiServe();
+    }
   } else if (state.phase === 'rally') {
+    stepPlayerHit(dt);
     stepAI(dt);
-    stepPhysics(dt);
+    stepBall(dt, true);
   } else if (state.phase === 'point') {
     state.timer -= dt;
+    stepBall(dt, false);      // let the ball settle visually
     if (state.timer <= 0) afterPoint();
   }
 }
@@ -1260,19 +1593,22 @@ function frame(ts) {
   const dt = Math.min(0.05, lastTs ? (ts - lastTs) / 1000 : 0.016);
   lastTs = ts;
   update(dt, ts);
-  render();
+  renderScene(dt);
+  if (!el.preview.classList.contains('hidden')) drawPreview();
+  syncHud();
   stepConfetti(dt);
   requestAnimationFrame(frame);
 }
 
 /* ============================================================
-   18. TEST SEAM — used by verify.js / capture.js (?test=1)
+   21. TEST SEAM — used by verify.js / capture.js (?test=1)
    ============================================================ */
 
 window.__airsmash = {
   state,
-  table,
+  TABLE,
   view,
+  get renderer() { return world.renderer; },
   // Place a fake hand (normalized, mirrored coords: x 0..1 left→right, y 0..1 top→bottom).
   setFakeHand(x, y) { state.fakeHand = { x, y }; },
   clearFakeHand() { state.fakeHand = null; },
@@ -1280,23 +1616,39 @@ window.__airsmash = {
   setFakeLandmarks(pts) { state.hand.landmarks = pts; },
   // Simulated camera feed for screenshots (an offscreen canvas).
   setFakeBackground(canvas) { state.fakeBackground = canvas; },
-  // Instantly end the serve countdown.
-  skipCountdown() { if (state.phase === 'serve') state.timer = 0; },
-  // Award a point as if the ball had crossed the endline.
+  // End the match-start countdown immediately.
+  skipCountdown() { if (state.phase === 'countdown') state.timer = 0; },
+  // Launch the current serve immediately (whichever side).
+  serveNow() {
+    if (state.phase !== 'serve') return;
+    if (state.serveSide === 'you') launchPlayerServe();
+    else launchAiServe();
+  },
+  // Award a point as if the rally had ended that way.
   forceScore(side) {
-    if (state.phase === 'serve') { state.phase = 'rally'; state.ball.vy = 1; }
-    if (state.phase === 'rally') scorePoint(side);
+    if (state.phase === 'over' || state.phase === 'point') return;
+    state.phase = 'rally';
+    scorePoint(side);
+  },
+  // Place the ball mid-rally (for screenshots / physics tests).
+  placeBall(x, y, z, vx, vy, vz, lastHitter = 'ai') {
+    const b = state.ball;
+    b.x = x; b.y = y; b.z = z;
+    b.vx = vx; b.vy = vy; b.vz = vz;
+    b.lastHitter = lastHitter;
+    b.bounces = 0;
+    b.validOpponentBounce = false;
+    b.visible = true;
   },
   // Advance the whole match to game over (for screenshots/tests).
   finishMatch(winner) {
     state.phase = 'rally';
-    while (state.phase !== 'over') {
-      const s = winner === 'you' ? state.scoreYou + 1 : state.scoreAI + 1;
-      if (winner === 'you') state.scoreYou = s; else state.scoreAI = s;
+    let guard = 0;
+    while (state.phase !== 'over' && guard++ < 60) {
+      if (winner === 'you') state.scoreYou++; else state.scoreAI++;
       state.phase = 'point';
       afterPoint();
       if (state.phase === 'point') state.phase = 'rally';
-      if (state.scoreYou + state.scoreAI > 60) break;   // safety valve
     }
   },
 };
@@ -1307,17 +1659,21 @@ window.__airsmash = {
 
 document.addEventListener('DOMContentLoaded', () => {
   cacheDom();
-  ctx = el.game.getContext('2d');
+  previewCtx = el.preview.getContext('2d');
   confettiCtx = el.confetti.getContext('2d');
+
+  try {
+    initThree();
+  } catch (err) {
+    showError('Graphics unavailable', 'WebGL could not start in this browser (' + (err && err.message || 'unknown') + ').');
+    return;
+  }
+
   layout();
   loadGame();
   setDifficulty(state.difficulty);
   syncSoundBtn();
   refreshIntroStats();
-  state.player.x = table.x + table.w / 2;
-  state.player.y = state.player.targetY = table.bottomY - 34;
-  state.ai.x = table.x + table.w / 2;
-  state.ai.targetX = state.ai.x;
   wireControls();
   showScreen('intro');
   requestAnimationFrame(frame);

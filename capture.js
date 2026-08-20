@@ -2,7 +2,7 @@
 // Usage: node capture.js
 //
 // Runs against ?test=1 with a simulated camera feed + fake hand skeleton,
-// so screenshots show the camera-behind-the-table look without a real camera.
+// so screenshots show the PiP camera preview without a real camera.
 
 import path from 'path';
 import http from 'http';
@@ -76,7 +76,10 @@ async function installFakeScene(page) {
 async function captureScreenshots() {
   if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--enable-unsafe-swiftshader'],   // software WebGL in headless
+  });
   const page = await (await browser.newContext({
     viewport: { width: 1280, height: 860 },
     deviceScaleFactor: 2,
@@ -87,36 +90,33 @@ async function captureScreenshots() {
   try {
     await page.goto(`http://localhost:${PORT}/?test=1`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
-    await page.waitForTimeout(600);   // let fonts settle
+    await page.waitForTimeout(800);   // let fonts + first renders settle
 
     // 1. Intro
     await page.screenshot({ path: path.join(OUT, 'intro.png') });
     console.log('saved intro.png');
 
-    // 2. Setup / calibration (camera preview + skeleton + paddle)
+    // 2. Setup / calibration (3D arena behind, PiP preview with skeleton)
     await page.click('#btn-start');
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
     await installFakeScene(page);
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(800);
     await page.screenshot({ path: path.join(OUT, 'setup.png') });
     console.log('saved setup.png');
 
-    // 3. Gameplay — mid rally, camera behind the table
+    // 3. Gameplay — mid rally, ball incoming over the net
     await page.click('#btn-start-match');
     await page.waitForTimeout(300);
     await page.evaluate(() => window.__airsmash.skipCountdown());
     await page.waitForTimeout(250);
-    // Place the ball mid-table with a fresh trail for a lively shot.
+    await page.evaluate(() => window.__airsmash.serveNow());
+    await page.waitForTimeout(250);
+    // Place the ball just over the net, arcing toward the player, with a fresh trail.
     await page.evaluate(() => {
-      const s = window.__airsmash.state;
-      const t = window.__airsmash.table;
-      s.ball.x = t.x + t.w * 0.62;
-      s.ball.y = t.y + t.h * 0.42;
-      s.ball.vx = 180;
-      s.ball.vy = 320;
-      s.rally = 4;
+      window.__airsmash.placeBall(0.22, 1.05, -0.15, -0.25, 1.1, 1.9, 'ai');
+      window.__airsmash.state.rally = 4;
     });
-    await page.waitForTimeout(160);
+    await page.waitForTimeout(180);
     await page.screenshot({ path: path.join(OUT, 'gameplay.png') });
     console.log('saved gameplay.png');
 

@@ -1,5 +1,5 @@
-// Automated verification: console errors, flow, hand input, physics, scoring,
-// pause, persistence, keyboard fallback, and mobile layout.
+// Automated verification: console errors, 3D flow, hand input, physics,
+// scoring, pause, persistence, keyboard fallback, and mobile layout.
 // Usage: node verify.js   → must end with "ALL CHECKS PASSED"
 //
 // Runs against ?test=1 (hermetic: no real camera, no model download).
@@ -37,7 +37,11 @@ function check(name, cond, extra = '') {
 server.listen(PORT, async () => {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
+    args: [
+      '--use-fake-ui-for-media-stream',
+      '--use-fake-device-for-media-stream',
+      '--enable-unsafe-swiftshader',   // software WebGL in headless
+    ],
   });
   const page = await (await browser.newContext({ viewport: { width: 1280, height: 860 } })).newPage();
 
@@ -54,7 +58,7 @@ server.listen(PORT, async () => {
   try {
     await page.goto(`http://localhost:${PORT}/?test=1`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
 
     // --- Intro ---
     check('intro visible', await page.isVisible('#screen-intro'));
@@ -62,6 +66,13 @@ server.listen(PORT, async () => {
     check('difficulty segment has 3 options', (await page.locator('#difficulty-seg button').count()) === 3);
     check('normal difficulty preselected', await page.locator('#difficulty-seg button.on').getAttribute('data-diff') === 'normal');
     check('stats row present', await page.isVisible('#intro-stats'));
+
+    // WebGL renderer initialized
+    check('WebGL renderer created', await page.evaluate(() => !!window.__airsmash.renderer));
+    check('game canvas has size', await page.evaluate(() => {
+      const c = document.getElementById('game');
+      return c.width > 100 && c.height > 100;
+    }));
 
     // Difficulty selection persists
     await page.click('#difficulty-seg button[data-diff="hard"]');
@@ -72,6 +83,7 @@ server.listen(PORT, async () => {
     await page.click('#btn-start');
     await page.waitForTimeout(300);
     check('setup screen visible', await page.isVisible('#screen-setup'));
+    check('preview canvas visible in setup', await page.isVisible('#preview'));
     check('start-match disabled before hand seen', await page.locator('#btn-start-match').isDisabled());
 
     // Fake hand appears → button enables
@@ -81,50 +93,64 @@ server.listen(PORT, async () => {
     check('start-match enabled after hand seen', !(await page.locator('#btn-start-match').isDisabled()));
     check('start-match label updates', (await page.textContent('#btn-start-match')).includes('Start match'));
 
-    // --- Gameplay: countdown → rally ---
+    // --- Gameplay: countdown → serve → rally ---
     await page.click('#btn-start-match');
     await page.waitForTimeout(200);
     check('setup hidden after start', !(await page.isVisible('#screen-setup')));
     check('HUD visible', await page.isVisible('#hud'));
-    check('serve phase active', (await api()).state.phase === 'serve');
-    check('serve chip says Your serve', (await page.textContent('#serve-chip')).includes('Your serve'));
+    check('countdown phase active', (await api()).state.phase === 'countdown');
     check('countdown banner visible', await page.isVisible('#banner'));
 
     await page.evaluate(() => window.__airsmash.skipCountdown());
     await page.waitForTimeout(250);
-    check('rally phase after countdown', (await api()).state.phase === 'rally');
+    check('serve phase after countdown', (await api()).state.phase === 'serve');
+    check('serve chip says Your serve', (await page.textContent('#serve-chip')).includes('Your serve'));
+    check('serve banner shown', (await page.textContent('#banner-text')).includes('Your serve'));
+
+    await page.evaluate(() => window.__airsmash.serveNow());
+    await page.waitForTimeout(250);
+    check('rally phase after serve', (await api()).state.phase === 'rally');
     check('banner hidden during rally', !(await page.isVisible('#banner')));
 
-    // Ball is moving
-    const ballPos1 = await page.evaluate(() => ({ x: window.__airsmash.state.ball.x, y: window.__airsmash.state.ball.y }));
-    await page.waitForTimeout(300);
-    const ballPos2 = await page.evaluate(() => ({ x: window.__airsmash.state.ball.x, y: window.__airsmash.state.ball.y }));
-    check('ball moves during rally', Math.abs(ballPos1.x - ballPos2.x) + Math.abs(ballPos1.y - ballPos2.y) > 20,
-      `Δ=${Math.round(Math.abs(ballPos1.x - ballPos2.x) + Math.abs(ballPos1.y - ballPos2.y))}`);
+    // Ball is moving in 3D
+    const ballPos1 = await page.evaluate(() => ({ ...window.__airsmash.state.ball }));
+    await page.waitForTimeout(350);
+    const ballPos2 = await page.evaluate(() => ({ ...window.__airsmash.state.ball }));
+    const moved = Math.abs(ballPos1.x - ballPos2.x) + Math.abs(ballPos1.y - ballPos2.y) + Math.abs(ballPos1.z - ballPos2.z);
+    check('ball moves during rally (3D)', moved > 0.15, `Δ=${moved.toFixed(2)}m`);
 
-    // --- Hand input moves the paddle ---
+    // Freeze physics (phase → idle) so the live rally can't score on its own
+    // while we measure paddle mapping. Input still updates in idle phase.
+    await page.evaluate(() => { window.__airsmash.state.phase = 'idle'; });
+
+    // --- Hand input moves the paddle in 3D ---
     const paddleX0 = await page.evaluate(() => window.__airsmash.state.player.x);
-    await page.evaluate(() => window.__airsmash.setFakeHand(0.15, 0.7));
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.15, 0.6));
     await page.waitForTimeout(500);
     const paddleX1 = await page.evaluate(() => window.__airsmash.state.player.x);
-    check('paddle follows hand left', paddleX1 < paddleX0 - 40, `x: ${Math.round(paddleX0)} → ${Math.round(paddleX1)}`);
+    check('paddle follows hand left', paddleX1 < paddleX0 - 0.3, `x: ${paddleX0.toFixed(2)} → ${paddleX1.toFixed(2)}`);
 
-    await page.evaluate(() => window.__airsmash.setFakeHand(0.85, 0.7));
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.85, 0.6));
     await page.waitForTimeout(500);
     const paddleX2 = await page.evaluate(() => window.__airsmash.state.player.x);
-    check('paddle follows hand right', paddleX2 > paddleX1 + 40, `x: ${Math.round(paddleX1)} → ${Math.round(paddleX2)}`);
+    check('paddle follows hand right', paddleX2 > paddleX1 + 0.3, `x: ${paddleX1.toFixed(2)} → ${paddleX2.toFixed(2)}`);
 
-    // Vertical mapping: hand high → paddle near net; hand low → paddle near bottom.
-    await page.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.35));
+    // Vertical mapping: hand high → paddle high; hand low → paddle low.
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.30));
     await page.waitForTimeout(500);
     const paddleYHigh = await page.evaluate(() => window.__airsmash.state.player.y);
-    await page.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.9));
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.85));
     await page.waitForTimeout(500);
     const paddleYLow = await page.evaluate(() => window.__airsmash.state.player.y);
-    check('paddle follows hand vertically', paddleYLow > paddleYHigh + 30, `y: ${Math.round(paddleYHigh)} → ${Math.round(paddleYLow)}`);
-    const geom = await page.evaluate(() => ({ netY: window.__airsmash.table.netY, bottomY: window.__airsmash.table.bottomY }));
-    check('paddle stays on player half', paddleYHigh > geom.netY && paddleYLow <= geom.bottomY,
-      `net=${Math.round(geom.netY)} paddle=${Math.round(paddleYHigh)}..${Math.round(paddleYLow)} bottom=${Math.round(geom.bottomY)}`);
+    check('paddle follows hand vertically', paddleYHigh > paddleYLow + 0.3, `y: ${paddleYHigh.toFixed(2)} → ${paddleYLow.toFixed(2)}`);
+
+    const ws = await page.evaluate(() => ({
+      x: window.__airsmash.state.player.x,
+      y: window.__airsmash.state.player.y,
+      z: window.__airsmash.state.player.z,
+    }));
+    check('paddle stays in workspace', Math.abs(ws.x) <= 1.06 && ws.y >= 0.8 && ws.y <= 1.65 && ws.z > 0.5 && ws.z < 1.4,
+      `(${ws.x.toFixed(2)}, ${ws.y.toFixed(2)}, ${ws.z.toFixed(2)})`);
 
     // --- Scoring ---
     await page.evaluate(() => window.__airsmash.forceScore('you'));
@@ -133,7 +159,7 @@ server.listen(PORT, async () => {
     check('player point scored', s.you === 1 && s.ai === 0, `${s.you}:${s.ai}`);
     check('point banner shown', await page.isVisible('#banner'));
 
-    await page.waitForTimeout(1200);   // point banner → next serve
+    await page.waitForTimeout(1400);   // point banner → next serve
     check('back to serve after point', (await api()).state.phase === 'serve');
 
     await page.evaluate(() => window.__airsmash.forceScore('ai'));
@@ -142,7 +168,7 @@ server.listen(PORT, async () => {
     check('AI point scored', s.you === 1 && s.ai === 1, `${s.you}:${s.ai}`);
 
     // --- Pause / resume ---
-    await page.evaluate(() => window.__airsmash.skipCountdown());
+    await page.evaluate(() => window.__airsmash.serveNow());
     await page.waitForTimeout(200);
     await page.click('#btn-pause');
     await page.waitForTimeout(200);
@@ -152,7 +178,8 @@ server.listen(PORT, async () => {
     const ballAtPause = await page.evaluate(() => ({ ...window.__airsmash.state.ball }));
     await page.waitForTimeout(400);
     const ballWhilePaused = await page.evaluate(() => ({ ...window.__airsmash.state.ball }));
-    check('ball frozen while paused', ballAtPause.x === ballWhilePaused.x && ballAtPause.y === ballWhilePaused.y);
+    check('ball frozen while paused',
+      ballAtPause.x === ballWhilePaused.x && ballAtPause.y === ballWhilePaused.y && ballAtPause.z === ballWhilePaused.z);
 
     await page.click('#btn-resume');
     await page.waitForTimeout(200);
@@ -174,9 +201,13 @@ server.listen(PORT, async () => {
     await page.waitForTimeout(250);
     s = await scores();
     check('restart resets scores', s.you === 0 && s.ai === 0, `${s.you}:${s.ai}`);
-    check('restart returns to serve', (await api()).state.phase === 'serve');
+    check('restart returns to countdown', (await api()).state.phase === 'countdown');
 
     // --- Win flow: finish the match ---
+    await page.evaluate(() => window.__airsmash.skipCountdown());
+    await page.waitForTimeout(200);
+    await page.evaluate(() => window.__airsmash.serveNow());
+    await page.waitForTimeout(200);
     await page.evaluate(() => window.__airsmash.finishMatch('you'));
     await page.waitForTimeout(400);
     check('game over overlay visible', await page.isVisible('#overlay-gameover'));
@@ -196,7 +227,7 @@ server.listen(PORT, async () => {
     s = await scores();
     check('rematch resets scores', s.you === 0 && s.ai === 0, `${s.you}:${s.ai}`);
     check('rematch hides game over', !(await page.isVisible('#overlay-gameover')));
-    check('rematch in serve phase', (await api()).state.phase === 'serve');
+    check('rematch in countdown phase', (await api()).state.phase === 'countdown');
 
     // --- Quit to menu ---
     await page.click('#btn-pause');
@@ -215,15 +246,21 @@ server.listen(PORT, async () => {
     await page.waitForTimeout(250);
     check('keyboard mode starts match', (await api()).state.screen === 'play');
     check('input mode is keyboard', (await api()).state.inputMode === 'keyboard');
+    check('preview hidden in keyboard mode', !(await page.isVisible('#preview')));
 
     await page.evaluate(() => window.__airsmash.skipCountdown());
     await page.waitForTimeout(200);
     const kx0 = await page.evaluate(() => window.__airsmash.state.player.x);
     await page.keyboard.down('ArrowLeft');
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(450);
     await page.keyboard.up('ArrowLeft');
     const kx1 = await page.evaluate(() => window.__airsmash.state.player.x);
-    check('arrow keys move paddle', kx1 < kx0 - 30, `x: ${Math.round(kx0)} → ${Math.round(kx1)}`);
+    check('arrow keys move paddle', kx1 < kx0 - 0.2, `x: ${kx0.toFixed(2)} → ${kx1.toFixed(2)}`);
+
+    // Space swing registers (serve launches on swing in keyboard mode)
+    await page.keyboard.press(' ');
+    await page.waitForTimeout(300);
+    check('space swing launches serve', (await api()).state.phase === 'rally', (await api()).state.phase);
 
     check('no console errors', errors.length === 0, errors.join(' | ').slice(0, 200));
 
@@ -239,11 +276,12 @@ server.listen(PORT, async () => {
 
     await mobile.goto(`http://localhost:${PORT}/?test=1`, { waitUntil: 'domcontentloaded' });
     await mobile.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
-    await mobile.waitForTimeout(300);
+    await mobile.waitForTimeout(400);
 
     check('mobile: intro visible', await mobile.isVisible('#screen-intro'));
     const startBox = await mobile.locator('#btn-start').boundingBox();
     check('mobile: start button on screen', startBox && startBox.y + startBox.height <= 844, startBox ? `y=${Math.round(startBox.y + startBox.height)}` : 'null');
+    check('mobile: WebGL renderer created', await mobile.evaluate(() => !!window.__airsmash.renderer));
 
     await mobile.click('#btn-start');
     await mobile.waitForTimeout(250);
@@ -255,12 +293,10 @@ server.listen(PORT, async () => {
     check('mobile: HUD visible', await mobile.isVisible('#hud'));
     const hudBox = await mobile.locator('#hud').boundingBox();
     check('mobile: HUD fits width', hudBox && hudBox.width <= 390, hudBox ? `w=${Math.round(hudBox.width)}` : 'null');
-    const tableBox = await mobile.evaluate(() => {
-      const t = window.__airsmash.table;
-      return { x: t.x, w: t.w, y: t.y, h: t.h };
-    });
-    check('mobile: table fits screen', tableBox.x >= 0 && tableBox.x + tableBox.w <= 390 && tableBox.y + tableBox.h <= 844,
-      `${Math.round(tableBox.w)}x${Math.round(tableBox.h)} @ ${Math.round(tableBox.x)},${Math.round(tableBox.y)}`);
+
+    const previewBox = await mobile.locator('#preview').boundingBox();
+    check('mobile: PiP preview visible in play', previewBox && previewBox.width > 60 && previewBox.y + previewBox.height <= 844,
+      previewBox ? `${Math.round(previewBox.width)}x${Math.round(previewBox.height)} @ y=${Math.round(previewBox.y)}` : 'null');
 
     const pauseBox = await mobile.locator('#btn-pause').boundingBox();
     check('mobile: pause button tappable (≥40px)', pauseBox && pauseBox.width >= 40 && pauseBox.height >= 40,

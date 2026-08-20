@@ -72,6 +72,32 @@ button { font-family: inherit; cursor: pointer; }
   z-index: 40;
 }
 
+/* ---------- Picture-in-picture camera preview ---------- */
+
+#preview {
+  position: fixed;
+  top: calc(64px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(320px, 62vw);
+  aspect-ratio: 4 / 3;
+  height: auto;
+  z-index: 55;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(77, 215, 255, 0.45);
+  box-shadow: 0 0 24px rgba(77, 215, 255, 0.25), var(--shadow);
+  background: #000;
+}
+
+#preview.in-play {
+  top: auto;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  left: 14px;
+  transform: none;
+  width: min(170px, 26vw);
+  opacity: 0.92;
+}
+
 /* ---------- HUD ---------- */
 
 #hud {
@@ -377,11 +403,15 @@ button { font-family: inherit; cursor: pointer; }
 
 #screen-setup {
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
+  gap: 12px;
   padding-top: calc(16px + env(safe-area-inset-top));
   padding-bottom: calc(16px + env(safe-area-inset-bottom));
 }
+
+/* Leave room for the centered preview canvas. */
+.setup-top { margin-top: calc(min(320px, 62vw) * 0.75 + 70px); }
 
 .setup-top { max-width: 420px; padding: 18px 26px; }
 .setup-top h2 { font-size: 20px; margin-bottom: 4px; }
@@ -527,6 +557,8 @@ kbd {
   .tagline, .privacy, .foot-hint { display: none; }
   .intro-col { gap: 10px; }
   .setup-steps { display: none; }
+  #preview { width: min(220px, 30vw); }
+  .setup-top { margin-top: calc(min(220px, 30vw) * 0.75 + 56px); }
 }
 
 /* ---------- Touch & motion preferences ---------- */

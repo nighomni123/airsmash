@@ -4,20 +4,26 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#070b16">
-  <title>AirSmash — Air Table Tennis</title>
-  <meta name="description" content="Play air table tennis against the AI using only your hand and your camera. No controllers — your hand is the paddle.">
+  <title>AirSmash — 3D Air Table Tennis</title>
+  <meta name="description" content="First-person 3D table tennis against the AI, played with your real hand on camera. No controllers — your hand is the paddle.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏓</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%93%3C/text%3E%3C/svg%3E">
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three.module.js" } }
+  </script>
 </head>
 <body>
   <!-- Hidden camera feed: the HandLandmarker reads frames from this element. -->
   <video id="camera" playsinline muted></video>
 
-  <!-- Main game canvas: camera background, table, ball, paddles, skeleton. -->
+  <!-- 3D scene (Three.js). -->
   <canvas id="game"></canvas>
+
+  <!-- Picture-in-picture camera preview with hand skeleton (calibration + play). -->
+  <canvas id="preview" class="hidden" width="320" height="240"></canvas>
 
   <!-- Confetti overlay canvas (win celebration). -->
   <canvas id="confetti"></canvas>
@@ -37,7 +43,7 @@
     </div>
   </header>
 
-  <!-- Big center banner: countdown numbers and point announcements. -->
+  <!-- Big center banner: serve prompts and point announcements. -->
   <div id="banner" class="hidden" aria-live="assertive">
     <div id="banner-text"></div>
     <div id="banner-sub"></div>
@@ -53,7 +59,7 @@
         <span class="logo-ball">🏓</span>
         <h1>AIR<span>SMASH</span></h1>
       </div>
-      <p class="tagline">Your hand is the paddle. Play air table tennis against the AI — no controller, just your camera.</p>
+      <p class="tagline">First-person 3D table tennis against the AI — played with your real hand. Move your palm to swing; no controller needed.</p>
       <p class="privacy">🔒 The camera runs 100% in your browser. Video never leaves your device.</p>
 
       <div class="difficulty-block">
@@ -78,7 +84,7 @@
   </section>
 
   <!-- ============ SETUP / CALIBRATION SCREEN ============ -->
-  <!-- Transparent: the live camera + skeleton preview renders on the canvas behind it. -->
+  <!-- Transparent: the 3D arena shows behind; the preview canvas is the calibration view. -->
   <section id="screen-setup" class="screen screen-transparent hidden">
     <div class="setup-top card">
       <h2>Get ready</h2>
@@ -87,9 +93,9 @@
     </div>
     <div class="setup-bottom card">
       <ol class="setup-steps">
-        <li><b>Raise one hand</b> into view, palm toward the camera.</li>
-        <li><b>Move it around</b> — left/right and up/down. The paddle follows your palm.</li>
-        <li><b>First to 11</b> points wins (win by 2). Good light helps tracking.</li>
+        <li><b>Raise one hand</b>, palm toward the camera — you'll see it in the preview above.</li>
+        <li><b>Move it around</b> — your paddle floats at the near end of the table and follows your palm.</li>
+        <li><b>Swing through the ball</b> to return it. First to 11 wins (win by 2).</li>
       </ol>
       <button id="btn-start-match" class="btn btn-primary btn-big" disabled>Waiting for hand…</button>
       <button id="btn-keyboard-mode" class="btn btn-ghost">Play with keyboard instead</button>
