@@ -162,7 +162,7 @@ node verify.js     # automated playthrough; must end with "ALL CHECKS PASSED"
 
 **Environment constraints (important):**
 - This machine runs **macOS 12.7.6**. Playwright ≥ 1.46 refuses to install Chromium here. The project is pinned to **`playwright@1.45.1`** — do not upgrade it.
-- Tooling lives **outside the repo**, in `../../Do not delete folder/` (i.e. `~/Documents/Projects/Do not delete folder/`): shared `.pw-browsers/` (Chromium 1124), shared `node_modules/` (playwright 1.45.1), and `.npm-cache/`. Both scripts set `process.env.PLAYWRIGHT_BROWSERS_PATH` to the shared browsers; the project's `node_modules` is a **symlink** to the shared one.
+- Tooling lives **outside the repo**, in `../../Do not delete folder/` (i.e. `~/Documents/Projects/Do not delete folder/`): shared `.pw-browsers/` (Chromium 1124), shared `node_modules/` (playwright 1.45.1), and `.npm-cache/`. Both scripts set `process.env.PLAYWRIGHT_BROWSERS_PATH` to the shared browsers **only when that folder exists**; on a fresh clone they fall back to Playwright's default browser location (`npm install && npx playwright install chromium`). The project's `node_modules` here is a **symlink** to the shared one (not committed).
 - If the shared `chromium-1124` is missing: `npm install --cache "$PWD/../../Do not delete folder/.npm-cache"` then `PLAYWRIGHT_BROWSERS_PATH="$PWD/../../Do not delete folder/.pw-browsers" npx playwright install chromium`.
 - **WebGL in headless Chromium**: both scripts launch with `--enable-unsafe-swiftshader` (software WebGL). Without it the renderer fails to initialize headless.
 - The local agent model **cannot view images** — verify visual changes via `verify.js` measurements (state values, bounding boxes), not by "looking" at screenshots.

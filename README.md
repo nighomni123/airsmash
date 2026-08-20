@@ -76,12 +76,22 @@ python3 -m http.server 8000
 
 Tips for best tracking: good lighting, plain-ish background, hand ~30–80 cm from the camera, palm facing the lens. Big, deliberate swings return the ball best.
 
-To regenerate the README screenshots and run the automated playthrough (workspace-local Playwright + Chromium):
+To regenerate the README screenshots and run the automated playthrough (Playwright + Chromium):
 
 ```bash
-node capture.js   # screenshots/*.png
-node verify.js    # must end with ALL CHECKS PASSED
+npm install                 # playwright (pinned to 1.45.1)
+npx playwright install chromium
+node capture.js             # screenshots/*.png
+node verify.js              # must end with ALL CHECKS PASSED
 ```
+
+## Development
+
+No build step, no framework — plain HTML/CSS/JS with a vendored Three.js. The game logic lives in one file (`app.js`, banner-commented sections); `AGENTS.md` documents the architecture, invariants and recipes for common changes.
+
+## License
+
+ISC — see [LICENSE](LICENSE).
 
 ## Future Roadmap
 

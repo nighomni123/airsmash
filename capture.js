@@ -10,7 +10,10 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, '..', '..', 'Do not delete folder', '.pw-browsers');
+// Use the shared browser cache when it exists (this machine); otherwise fall
+// back to Playwright's default location (fresh clones: `npx playwright install chromium`).
+const SHARED_BROWSERS = path.join(__dirname, '..', '..', 'Do not delete folder', '.pw-browsers');
+if (fs.existsSync(SHARED_BROWSERS)) process.env.PLAYWRIGHT_BROWSERS_PATH = SHARED_BROWSERS;
 
 const { chromium } = await import('playwright');
 
