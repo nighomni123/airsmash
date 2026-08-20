@@ -8,6 +8,22 @@ node_modules
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
 # Logs
 *.log
+npm-debug.log*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment & secrets
+.env
+.env.*
+
+# OS / misc
+Thumbs.db
