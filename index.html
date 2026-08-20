@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#070b16">
+  <title>AirSmash — Air Table Tennis</title>
+  <meta name="description" content="Play air table tennis against the AI using only your hand and your camera. No controllers — your hand is the paddle.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏓</text></svg>">
+</head>
+<body>
+  <!-- Hidden camera feed: the HandLandmarker reads frames from this element. -->
+  <video id="camera" playsinline muted></video>
+
+  <!-- Main game canvas: camera background, table, ball, paddles, skeleton. -->
+  <canvas id="game"></canvas>
+
+  <!-- Confetti overlay canvas (win celebration). -->
+  <canvas id="confetti"></canvas>
+
+  <!-- ============ HUD (visible during play) ============ -->
+  <header id="hud" class="hidden">
+    <div class="chip score-chip" aria-live="polite">
+      <span class="score-side you"><small>YOU</small><b id="score-you">0</b></span>
+      <span class="score-sep">:</span>
+      <span class="score-side ai"><small>AI</small><b id="score-ai">0</b></span>
+    </div>
+    <div class="chip" id="rally-chip">Rally <b id="rally-count">0</b></div>
+    <div class="chip" id="serve-chip">Your serve</div>
+    <div class="hud-btns">
+      <button id="btn-sound" class="icon-btn" title="Sound on/off" aria-label="Toggle sound">🔊</button>
+      <button id="btn-pause" class="icon-btn" title="Pause (P)" aria-label="Pause game">⏸</button>
+    </div>
+  </header>
+
+  <!-- Big center banner: countdown numbers and point announcements. -->
+  <div id="banner" class="hidden" aria-live="assertive">
+    <div id="banner-text"></div>
+    <div id="banner-sub"></div>
+  </div>
+
+  <!-- "Show your hand" nudge when tracking loses the hand. -->
+  <div id="hand-hint" class="hidden">✋ Show your hand to the camera</div>
+
+  <!-- ============ INTRO SCREEN ============ -->
+  <section id="screen-intro" class="screen">
+    <div class="intro-col">
+      <div class="logo" aria-label="AirSmash">
+        <span class="logo-ball">🏓</span>
+        <h1>AIR<span>SMASH</span></h1>
+      </div>
+      <p class="tagline">Your hand is the paddle. Play air table tennis against the AI — no controller, just your camera.</p>
+      <p class="privacy">🔒 The camera runs 100% in your browser. Video never leaves your device.</p>
+
+      <div class="difficulty-block">
+        <div class="difficulty-label">Difficulty</div>
+        <div class="seg" id="difficulty-seg" role="radiogroup" aria-label="Difficulty">
+          <button data-diff="easy" role="radio" aria-checked="false">Easy</button>
+          <button data-diff="normal" class="on" role="radio" aria-checked="true">Normal</button>
+          <button data-diff="hard" role="radio" aria-checked="false">Hard</button>
+        </div>
+      </div>
+
+      <button id="btn-start" class="btn btn-primary btn-big">Start playing</button>
+
+      <div class="stats-row" id="intro-stats">
+        <div class="stat"><b id="stat-wins">0</b><small>Wins</small></div>
+        <div class="stat"><b id="stat-losses">0</b><small>Losses</small></div>
+        <div class="stat"><b id="stat-rally">0</b><small>Best rally</small></div>
+      </div>
+
+      <p class="foot-hint">Works best in good light · hold your phone in landscape</p>
+    </div>
+  </section>
+
+  <!-- ============ SETUP / CALIBRATION SCREEN ============ -->
+  <!-- Transparent: the live camera + skeleton preview renders on the canvas behind it. -->
+  <section id="screen-setup" class="screen screen-transparent hidden">
+    <div class="setup-top card">
+      <h2>Get ready</h2>
+      <p id="setup-status">Starting camera…</p>
+      <div id="setup-progress" class="progress hidden"><div id="setup-progress-bar"></div></div>
+    </div>
+    <div class="setup-bottom card">
+      <ol class="setup-steps">
+        <li><b>Raise one hand</b> into view, palm toward the camera.</li>
+        <li><b>Move it around</b> — left/right and up/down. The paddle follows your palm.</li>
+        <li><b>First to 11</b> points wins (win by 2). Good light helps tracking.</li>
+      </ol>
+      <button id="btn-start-match" class="btn btn-primary btn-big" disabled>Waiting for hand…</button>
+      <button id="btn-keyboard-mode" class="btn btn-ghost">Play with keyboard instead</button>
+    </div>
+  </section>
+
+  <!-- ============ ERROR SCREEN ============ -->
+  <section id="screen-error" class="screen hidden">
+    <div class="card error-card">
+      <div class="error-icon">📷</div>
+      <h2 id="error-title">Camera unavailable</h2>
+      <p id="error-msg">Something went wrong.</p>
+      <button id="btn-retry" class="btn btn-primary">Try again</button>
+      <button id="btn-error-keyboard" class="btn btn-ghost">Play with keyboard instead</button>
+      <button id="btn-error-menu" class="btn btn-ghost">Back to menu</button>
+    </div>
+  </section>
+
+  <!-- ============ PAUSE OVERLAY ============ -->
+  <div id="overlay-pause" class="overlay hidden">
+    <div class="card">
+      <h2>Paused</h2>
+      <div class="overlay-btns">
+        <button id="btn-resume" class="btn btn-primary btn-big">Resume</button>
+        <button id="btn-restart" class="btn btn-ghost">Restart match</button>
+        <button id="btn-quit" class="btn btn-ghost">Quit to menu</button>
+      </div>
+      <p class="mini-hint">Press <kbd>P</kbd> or <kbd>Esc</kbd> to resume</p>
+    </div>
+  </div>
+
+  <!-- ============ GAME OVER OVERLAY ============ -->
+  <div id="overlay-gameover" class="overlay hidden">
+    <div class="card gameover-card">
+      <div id="gameover-emoji">🏆</div>
+      <h2 id="gameover-title">You win!</h2>
+      <div id="gameover-score" class="final-score">11 : 7</div>
+      <div class="gameover-stats">
+        <div class="stat"><b id="gameover-rally">0</b><small>Longest rally</small></div>
+        <div class="stat"><b id="gameover-diff">Normal</b><small>Difficulty</small></div>
+      </div>
+      <div class="overlay-btns">
+        <button id="btn-rematch" class="btn btn-primary btn-big">Rematch</button>
+        <button id="btn-change-diff" class="btn btn-ghost">Change difficulty</button>
+        <button id="btn-menu" class="btn btn-ghost">Main menu</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Small transient message. -->
+  <div id="toast" class="hidden"></div>
+
+  <noscript><p class="noscript">AirSmash needs JavaScript to run.</p></noscript>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

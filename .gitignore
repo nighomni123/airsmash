@@ -1,0 +1,13 @@
+# Dependencies (no trailing slash: also covers the node_modules symlink to shared tooling)
+node_modules
+
+# Local tooling caches
+.npm-cache/
+.pw-browsers/
+.gh-config/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

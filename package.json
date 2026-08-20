@@ -1,0 +1,22 @@
+{
+  "name": "airsmash",
+  "version": "1.0.0",
+  "description": "AirSmash — camera hand-tracked air table tennis for the browser. Your hand is the paddle.",
+  "main": "app.js",
+  "scripts": {
+    "test": "node verify.js"
+  },
+  "keywords": [
+    "game",
+    "table-tennis",
+    "hand-tracking",
+    "mediapipe",
+    "browser"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.45.1"
+  }
+}
