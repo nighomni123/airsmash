@@ -98,6 +98,12 @@ button { font-family: inherit; cursor: pointer; }
   opacity: 0.92;
 }
 
+/* Two-player: the split preview straddles the seam between the two POVs. */
+#preview.in-play.split {
+  left: 50%;
+  transform: translateX(-50%);
+}
+
 /* ---------- HUD ---------- */
 
 #hud {
@@ -292,6 +298,12 @@ button { font-family: inherit; cursor: pointer; }
 
 .difficulty-block { display: flex; flex-direction: column; gap: 8px; align-items: center; }
 .difficulty-label { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-dim); font-weight: 600; }
+
+.mode-hint {
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-top: -2px;
+}
 
 .seg {
   display: flex;

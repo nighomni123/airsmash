@@ -66,6 +66,8 @@ server.listen(PORT, async () => {
     // --- Intro ---
     check('intro visible', await page.isVisible('#screen-intro'));
     check('start button visible', await page.isVisible('#btn-start'));
+    check('mode segment has 2 options', (await page.locator('#mode-seg button').count()) === 2);
+    check('vs-ai mode preselected', await page.locator('#mode-seg button.on').getAttribute('data-mode') === 'ai');
     check('difficulty segment has 3 options', (await page.locator('#difficulty-seg button').count()) === 3);
     check('normal difficulty preselected', await page.locator('#difficulty-seg button.on').getAttribute('data-diff') === 'normal');
     check('stats row present', await page.isVisible('#intro-stats'));
@@ -264,6 +266,132 @@ server.listen(PORT, async () => {
     await page.keyboard.press(' ');
     await page.waitForTimeout(300);
     check('space swing launches serve', (await api()).state.phase === 'rally', (await api()).state.phase);
+
+    // --- Two-player mode ---
+    await page.click('#btn-pause');
+    await page.waitForTimeout(150);
+    await page.click('#btn-quit');
+    await page.waitForTimeout(250);
+    check('2p: back on intro', await page.isVisible('#screen-intro'));
+
+    await page.click('#mode-seg button[data-mode="2p"]');
+    await page.waitForTimeout(150);
+    check('2p: mode selected', (await api()).state.mode === '2p');
+    check('2p: difficulty block hidden', !(await page.isVisible('#difficulty-block')));
+    const savedMode = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem('airsmash.save.v1')).mode; } catch { return null; }
+    });
+    check('2p: mode persisted', savedMode === '2p', String(savedMode));
+
+    await page.click('#btn-start');
+    await page.waitForTimeout(300);
+    check('2p: setup screen visible', await page.isVisible('#screen-setup'));
+    check('2p: start-match disabled before hands seen', await page.locator('#btn-start-match').isDisabled());
+
+    // One hand alone is not enough in two-player mode.
+    await page.evaluate(() => window.__airsmash.setFakeHands([{ x: 0.32, y: 0.62 }]));
+    await page.waitForTimeout(400);
+    check('2p: P1 hand slot detected', (await api()).state.hand.detected === true);
+    check('2p: P2 hand slot still empty', (await api()).state.hand2.detected === false);
+    check('2p: one hand is not enough', await page.locator('#btn-start-match').isDisabled());
+
+    // Both hands → unlocked.
+    await page.evaluate(() => window.__airsmash.setFakeHands([{ x: 0.32, y: 0.62 }, { x: 0.72, y: 0.68 }]));
+    await page.waitForTimeout(400);
+    check('2p: both hand slots detected', (await api()).state.hand.detected === true && (await api()).state.hand2.detected === true);
+    check('2p: start-match enabled with both hands', !(await page.locator('#btn-start-match').isDisabled()));
+
+    await page.click('#btn-start-match');
+    await page.waitForTimeout(250);
+    check('2p: HUD labels are P1/P2',
+      (await page.textContent('#score-label-you')) === 'P1' &&
+      (await page.textContent('#score-label-ai')) === 'P2');
+
+    // Opposite ends + split screen: P1 near, P2 far, second POV camera.
+    const p2z = await page.evaluate(() => window.__airsmash.state.p2.z);
+    check('2p: P2 takes the far rail', Math.abs(p2z + 1.15) < 0.01, `z=${p2z.toFixed(2)}`);
+    check('2p: second POV camera exists', await page.evaluate(() => !!window.__airsmash.camera2));
+    const vpOk = await page.evaluate(() => {
+      const A = window.__airsmash, r = A.renderer;
+      if (!r || !r.getViewport) return false;
+      const v = { x: 0, y: 0, z: 0, w: 0, copy(p) { this.x = p.x; this.y = p.y; this.z = p.z; this.w = p.w; return this; } };
+      r.getViewport(v);
+      return Math.abs(v.z - A.view.w / 2) < 40;
+    });
+    check('2p: split-screen viewports active', vpOk);
+
+    // Hands drive their own paddles; P2's x is flipped for their 180° POV.
+    const t1 = await page.evaluate(() => window.__airsmash.state.player.targetX);
+    const t2 = await page.evaluate(() => window.__airsmash.state.p2.targetX);
+    check('2p: P1 hand drives near paddle', t1 < -0.2, `targetX=${t1.toFixed(2)}`);
+    check('2p: P2 hand x flipped for far POV', t2 < -0.2, `targetX=${t2.toFixed(2)}`);
+
+    await page.evaluate(() => window.__airsmash.skipCountdown());
+    await page.waitForTimeout(250);
+    check('2p: serve chip names a player', /^P\d serve$/.test((await page.textContent('#serve-chip')).trim()), await page.textContent('#serve-chip'));
+
+    await page.evaluate(() => window.__airsmash.forceScore('ai'));
+    await page.waitForTimeout(300);
+    check('2p: point banner names Player 2', (await page.textContent('#banner-text')).includes('Player 2'), await page.textContent('#banner-text'));
+    let s2 = await scores();
+    check('2p: point registered for P2', s2.you === 0 && s2.ai === 1, `${s2.you}:${s2.ai}`);
+
+    // Both near-rail paddles can strike the ball, and lastHitter alternates.
+    await page.evaluate(() => {
+      const st = window.__airsmash.state;
+      st.phase = 'rally';
+      const p = st.player;
+      window.__airsmash.placeBall(p.x, p.y, p.z - 0.12, 0, 0, -0.4, 'ai');
+    });
+    await page.waitForTimeout(150);
+    check('2p: P1 paddle returns ball', (await api()).state.ball.lastHitter === 'you', (await api()).state.ball.lastHitter);
+
+    await page.evaluate(() => {
+      const st = window.__airsmash.state;
+      st.phase = 'rally';
+      const q = st.p2;
+      window.__airsmash.placeBall(q.x, q.y, q.z - 0.12, 0, 0, -0.4, 'you');
+    });
+    await page.waitForTimeout(150);
+    check('2p: P2 paddle returns ball', (await api()).state.ball.lastHitter === 'ai', (await api()).state.ball.lastHitter);
+
+    // Two-player keyboard split: P2 = arrows, P1 = WASD.
+    await page.evaluate(() => window.__airsmash.clearFakeHand());
+    await page.click('#btn-pause');
+    await page.waitForTimeout(150);
+    await page.click('#btn-quit');
+    await page.waitForTimeout(250);
+    await page.click('#btn-start');
+    await page.waitForTimeout(300);
+    await page.click('#btn-keyboard-mode');
+    await page.waitForTimeout(250);
+    check('2p: keyboard mode starts match', (await api()).state.screen === 'play' && (await api()).state.inputMode === 'keyboard');
+    await page.evaluate(() => window.__airsmash.skipCountdown());
+    await page.waitForTimeout(250);
+
+    const p2x0 = await page.evaluate(() => window.__airsmash.state.p2.x);
+    await page.keyboard.down('ArrowLeft');
+    await page.waitForTimeout(450);
+    await page.keyboard.up('ArrowLeft');
+    const p2x1 = await page.evaluate(() => window.__airsmash.state.p2.x);
+    // P2 watches a 180°-rotated view: their left is world +x.
+    check('2p: arrows drive P2 paddle (their left = +x)', p2x1 > p2x0 + 0.2, `x: ${p2x0.toFixed(2)} → ${p2x1.toFixed(2)}`);
+
+    const p1x0 = await page.evaluate(() => window.__airsmash.state.player.x);
+    await page.keyboard.down('d');
+    await page.waitForTimeout(450);
+    await page.keyboard.up('d');
+    const p1x1 = await page.evaluate(() => window.__airsmash.state.player.x);
+    check('2p: WASD drives P1 paddle', p1x1 > p1x0 + 0.2, `x: ${p1x0.toFixed(2)} → ${p1x1.toFixed(2)}`);
+
+    // Back to VS AI for a clean end state.
+    await page.click('#btn-pause');
+    await page.waitForTimeout(150);
+    await page.click('#btn-quit');
+    await page.waitForTimeout(250);
+    await page.click('#mode-seg button[data-mode="ai"]');
+    await page.waitForTimeout(150);
+    check('2p: difficulty block back in vs-ai mode', await page.isVisible('#difficulty-block'));
 
     check('no console errors', errors.length === 0, errors.join(' | ').slice(0, 200));
 

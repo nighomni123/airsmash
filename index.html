@@ -31,9 +31,9 @@
   <!-- ============ HUD (visible during play) ============ -->
   <header id="hud" class="hidden">
     <div class="chip score-chip" aria-live="polite">
-      <span class="score-side you"><small>YOU</small><b id="score-you">0</b></span>
+      <span class="score-side you"><small id="score-label-you">YOU</small><b id="score-you">0</b></span>
       <span class="score-sep">:</span>
-      <span class="score-side ai"><small>AI</small><b id="score-ai">0</b></span>
+      <span class="score-side ai"><small id="score-label-ai">AI</small><b id="score-ai">0</b></span>
     </div>
     <div class="chip" id="rally-chip">Rally <b id="rally-count">0</b></div>
     <div class="chip" id="serve-chip">Your serve</div>
@@ -63,6 +63,15 @@
       <p class="privacy">🔒 The camera runs 100% in your browser. Video never leaves your device.</p>
 
       <div class="difficulty-block">
+        <div class="difficulty-label">Mode</div>
+        <div class="seg" id="mode-seg" role="radiogroup" aria-label="Game mode">
+          <button data-mode="ai" class="on" role="radio" aria-checked="true">VS AI</button>
+          <button data-mode="2p" role="radio" aria-checked="false">2 Players</button>
+        </div>
+        <p class="mode-hint" id="mode-hint">One hand is your paddle.</p>
+      </div>
+
+      <div class="difficulty-block" id="difficulty-block">
         <div class="difficulty-label">Difficulty</div>
         <div class="seg" id="difficulty-seg" role="radiogroup" aria-label="Difficulty">
           <button data-diff="easy" role="radio" aria-checked="false">Easy</button>
@@ -93,8 +102,8 @@
     </div>
     <div class="setup-bottom card">
       <ol class="setup-steps">
-        <li><b>Raise one hand</b>, palm toward the camera — you'll see it in the preview above.</li>
-        <li><b>Move it around</b> — your paddle floats at the near end of the table and follows your palm.</li>
+        <li><b>Raise your hand</b> (both hands in 2-player mode), palm toward the camera — you'll see it in the preview above.</li>
+        <li><b>Move it around</b> — your paddle follows your palm. In 2P you face each other across the net: P1's view is the left half of the screen, P2's the right.</li>
         <li><b>Swing through the ball</b> to return it. First to 11 wins (win by 2).</li>
       </ol>
       <button id="btn-start-match" class="btn btn-primary btn-big" disabled>Waiting for hand…</button>

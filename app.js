@@ -2,6 +2,8 @@
    AirSmash — app.js  (3D first-person table tennis)
    Your hand is the paddle. Camera behind your end of the table,
    full view of the net, the opponent and the arena.
+   Two-player mode: two hands, two paddles on the near rail
+   (P1 left half, P2 right half) sharing one camera.
 
    Sections (banner-commented, top to bottom):
      1. Constants        — table dimensions, physics, difficulty
@@ -10,13 +12,14 @@
      4. Layout           — renderer/camera sizing
      5. Persistence      — localStorage save/load
      6. Screen flow      — showScreen(), overlays
-     7. Camera & tracking— getUserMedia + MediaPipe HandLandmarker
-     8. Hand input       — mirror, map to 3D paddle, swing velocity
+     7. Camera & tracking— getUserMedia + HandLandmarker in a worker
+                           (hand-worker.js) with sync main-thread fallback
+     8. Hand input       — mirror, map to 3D paddles, swing velocity
      9. 3D scene         — arena, table, net, paddles, ball (Three.js)
     10. Match flow       — reset, serve, score, win
     11. Shot solver      — ballistic aim with net clearance
     12. Ball physics     — gravity, table bounce, net, out of bounds
-    13. Player hitting   — swing detection + returns
+    13. Player hitting   — swing detection + returns (both players)
     14. AI opponent      — prediction, movement, returns, serves
     15. Rendering        — render pass, PiP preview, HUD sync
     16. Banner / Toast
@@ -46,13 +49,22 @@ const MP_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarke
 // Hand → paddle mapping (normalized camera coords, AFTER mirroring).
 const HAND_X_MIN = 0.10, HAND_X_MAX = 0.90;
 const HAND_Y_MIN = 0.25, HAND_Y_MAX = 0.90;
-const SMOOTH_RATE = 16;                        // exp-filter rate (per second)
-const HAND_LOST_MS = 500;                      // grace before "show your hand"
 
-// Paddle workspace (world meters, player's near side).
+// Speed-adaptive smoothing (one-euro style): a slow hand is filtered
+// hard (stable paddle), a fast swing barely at all (no input lag).
+// Rate = exp-filter rate per second; alpha = 1 - exp(-dt * rate).
+const SMOOTH_SLOW = 9, SMOOTH_FAST = 36;
+const ADAPT_REF_SPEED = 0.85;                  // normalized units/sec that maps to the fast end
+
+const HAND_LOST_MS = 500;                      // grace before "show your hand"
+const ASSIGN_MEMORY_MS = 1200;                 // how long a slot remembers its last hand position
+
+// Paddle workspace (world meters). P1 lives on the near rail (+z); in
+// two-player, P2 takes the far rail (−z) — real opposite-ends play.
 const PADDLE_X_RANGE = 1.05;
 const PADDLE_Y_TOP = 1.62, PADDLE_Y_BOT = 0.82;
-const PADDLE_Z = 1.05;
+const PADDLE_Z = 1.05;                         // near rail (P1 / the human in VS-AI)
+const PADDLE_Z_FAR = -1.15;                    // far rail (P2 in two-player)
 const PADDLE_REACH = 0.32;                     // hit radius around the paddle
 
 // Table (ITTF proportions, in meters). z: -far … +near (player at +z).
@@ -101,6 +113,7 @@ const HAND_CONNECTIONS = [
 const PALM_IDX = [0, 5, 9, 13, 17];            // stable palm centroid
 
 const KEY_SPEED = 1.7;                         // keyboard fallback m/s
+const PREVIEW_INTERVAL_MS = 33;                // PiP redraw cap (~30fps saves main-thread time)
 
 const TEST_MODE = new URLSearchParams(location.search).has('test');
 const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -115,13 +128,14 @@ const state = {
   paused: false,
   difficulty: 'normal',
   inputMode: 'hand',         // hand | keyboard
+  mode: 'ai',                // ai = vs AI (P1 only) | 2p = two human players
 
   // Match
   scoreYou: 0,
   scoreAI: 0,
   rally: 0,
   longestRally: 0,
-  serveSide: 'you',          // you | ai
+  serveSide: 'you',          // you | ai   ('ai' key = player 2 in 2p mode)
   serveTimer: 0,
   timer: 0,                  // countdown / point-phase timer
   lastCountdown: -1,
@@ -137,20 +151,17 @@ const state = {
     visible: true,
   },
 
-  // Paddles (world positions)
-  player: { x: 0, y: 1.1, z: PADDLE_Z, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.1, hitCooldown: 0 },
-  ai: { x: 0, y: 1.0, z: -1.15, vx: 0, targetX: 0, targetY: 1.0, hitCooldown: 0, reactT: 0, aimErrX: 0, aimErrZ: 0 },
+  // Near/far paddles. Internal ids match the scoring keys:
+  // player.id='you' (player 1, near rail), p2.id='ai' (player 2 in 2p,
+  // far rail), ai.id='ai' (the bot). Scoring/HUD code never needs to know.
+  player: { id: 'you', x: 0, y: 1.1, z: PADDLE_Z, railZ: PADDLE_Z, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.1, hitCooldown: 0 },
+  p2:      { id: 'ai',  x: 0, y: 1.0, z: PADDLE_Z_FAR, railZ: PADDLE_Z_FAR, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.0, hitCooldown: 0 },
+  ai: { id: 'ai', x: 0, y: 1.0, z: -1.15, vx: 0, targetX: 0, targetY: 1.0, hitCooldown: 0, reactT: 0, aimErrX: 0, aimErrZ: 0 },
 
-  // Hand tracking
-  hand: {
-    detected: false,
-    everDetected: false,
-    lostMs: 0,
-    rawX: 0.5, rawY: 0.7,    // normalized, mirrored
-    smX: 0.5, smY: 0.7,      // smoothed normalized
-    landmarks: null,         // latest raw (unmirrored) landmarks, for skeleton
-  },
-  fakeHand: null,            // test seam: { x, y } normalized mirrored coords
+  // Hand tracking — one slot per player (slot 1 only used in 2p mode).
+  hand: makeHandSlot(),
+  hand2: makeHandSlot(),
+  fakeHands: null,           // test seam: [{ x, y }, …] normalized mirrored coords
   fakeBackground: null,      // test seam: canvas used as simulated camera feed
 
   // Setup
@@ -162,7 +173,26 @@ const state = {
   stats: { wins: 0, losses: 0, bestRally: 0 },
 };
 
-const keys = { left: false, right: false, up: false, down: false, swing: 0 };
+function makeHandSlot() {
+  return {
+    detected: false,
+    everDetected: false,
+    lostMs: 0,
+    rawX: 0.5, rawY: 0.7,    // normalized, mirrored
+    smX: 0.5, smY: 0.7,      // smoothed normalized
+    motion: 0,               // short-average raw speed (normalized/s) → adaptive smoothing
+    prevRawX: 0.5, prevRawY: 0.7,
+    assignX: 0.5, assignY: 0.7, // last seen palm position (for hand→player assignment)
+    lastSeenMs: -1e9,
+    landmarks: null,         // latest raw (unmirrored) landmarks, for skeleton
+  };
+}
+
+// Keyboard state — two pads so both players can play on one keyboard.
+// pad1: WASD + Space (arrows merge into pad1 in single-player mode).
+// pad2: Arrows + Enter (two-player mode).
+const pad1Keys = { left: false, right: false, up: false, down: false, swing: 0 };
+const pad2Keys = { left: false, right: false, up: false, down: false, swing: 0 };
 
 /* ============================================================
    3. DOM REFS
@@ -173,10 +203,12 @@ const el = {};
 function cacheDom() {
   const ids = [
     'camera', 'game', 'preview', 'confetti', 'hud', 'score-you', 'score-ai',
+    'score-label-you', 'score-label-ai',
     'rally-count', 'serve-chip', 'btn-sound', 'btn-pause',
     'banner', 'banner-text', 'banner-sub', 'hand-hint',
     'screen-intro', 'screen-setup', 'screen-error',
     'overlay-pause', 'overlay-gameover', 'toast',
+    'mode-seg', 'mode-hint', 'difficulty-block',
     'difficulty-seg', 'btn-start', 'stat-wins', 'stat-losses', 'stat-rally',
     'setup-status', 'setup-progress', 'setup-progress-bar',
     'btn-start-match', 'btn-keyboard-mode',
@@ -221,6 +253,7 @@ function saveGame() {
     localStorage.setItem(SAVE_KEY, JSON.stringify({
       sound: state.sound,
       difficulty: state.difficulty,
+      mode: state.mode,
       stats: state.stats,
     }));
   } catch { /* storage unavailable — ignore */ }
@@ -233,6 +266,7 @@ function loadGame() {
     const data = JSON.parse(raw);
     if (typeof data.sound === 'boolean') state.sound = data.sound;
     if (data.difficulty && DIFFICULTY[data.difficulty]) state.difficulty = data.difficulty;
+    if (data.mode === 'ai' || data.mode === '2p') state.mode = data.mode;
     if (data.stats && typeof data.stats === 'object') {
       state.stats.wins = data.stats.wins | 0;
       state.stats.losses = data.stats.losses | 0;
@@ -257,11 +291,45 @@ function showScreen(name) {
   const showPreview = state.inputMode === 'hand' && (name === 'setup' || name === 'play');
   el.preview.classList.toggle('hidden', !showPreview);
   el.preview.classList.toggle('in-play', name === 'play');
+  el.preview.classList.toggle('split', twoPlayer());
 
   if (name !== 'play') {
     el['hand-hint'].classList.add('hidden');
     el.banner.classList.add('hidden');
   }
+}
+
+// Display names for the two sides, per mode. Internal keys stay
+// 'you'/'ai' everywhere (scoring, ball.lastHitter); only text differs.
+function sideLabel(side) {
+  if (state.mode === '2p') return side === 'you' ? 'Player 1' : 'Player 2';
+  return side === 'you' ? 'You' : 'AI';
+}
+
+const MODE_HINTS = {
+  ai: 'One hand is your paddle — move it to swing.',
+  2: 'Two hands, two paddles: P1 left half · P2 right half.',
+};
+
+function syncModeUi() {
+  for (const btn of el['mode-seg'].querySelectorAll('button')) {
+    const on = btn.dataset.mode === state.mode;
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-checked', String(on));
+  }
+  el['difficulty-block'].classList.toggle('hidden', state.mode === '2p');
+  if (el['mode-hint']) {
+    el['mode-hint'].textContent = state.mode === '2p'
+      ? 'Split screen — P1 plays from the near end (left view), P2 from the far end (right view).'
+      : 'One hand is your paddle.';
+  }
+}
+
+function setMode(mode) {
+  if (mode !== 'ai' && mode !== '2p') return;
+  state.mode = mode;
+  syncModeUi();
+  saveGame();
 }
 
 function refreshIntroStats() {
@@ -275,19 +343,23 @@ function goToIntro() {
   state.phase = 'idle';
   refreshIntroStats();
   syncSoundBtn();
+  syncModeUi();
   showScreen('intro');
 }
 
 function goToSetup() {
   state.inputMode = 'hand';
   state.hand.everDetected = false;
+  state.hand2.everDetected = false;
   el['btn-start-match'].disabled = true;
-  el['btn-start-match'].textContent = 'Waiting for hand…';
+  el['btn-start-match'].textContent = twoPlayer() ? 'Waiting for both hands…' : 'Waiting for hand…';
   el['setup-progress'].classList.remove('hidden');
   setSetupStatus('Starting camera…');
   showScreen('setup');
   initCameraAndModel();
 }
+
+function twoPlayer() { return state.mode === '2p'; }
 
 function setSetupStatus(msg) { el['setup-status'].textContent = msg; }
 
@@ -300,9 +372,12 @@ function setupReadyCheck() {
   if (state.cameraReady && state.modelReady) {
     setSetupProgress(1);
     el['setup-progress'].classList.add('hidden');
-    setSetupStatus('Camera ready — show your hand ✋');
+    setSetupStatus(twoPlayer() ? 'Camera ready — show both hands ✋✋' : 'Camera ready — show your hand ✋');
   }
-  if (state.hand.everDetected) {
+  const ready = twoPlayer()
+    ? (state.hand.everDetected && state.hand2.everDetected)
+    : state.hand.everDetected;
+  if (ready) {
     el['btn-start-match'].disabled = false;
     el['btn-start-match'].textContent = 'Start match';
   }
@@ -319,7 +394,6 @@ function showError(title, msg) {
    ============================================================ */
 
 let video = null;
-let landmarker = null;
 let visionModule = null;
 
 async function initCameraAndModel() {
@@ -333,7 +407,9 @@ async function initCameraAndModel() {
   try {
     await camPromise;
     state.cameraReady = true;
-    setSetupStatus(state.modelReady ? 'Camera ready — show your hand ✋' : 'Loading hand-tracking model…');
+    setSetupStatus(state.modelReady
+      ? (twoPlayer() ? 'Camera ready — show both hands ✋✋' : 'Camera ready — show your hand ✋')
+      : 'Loading hand-tracking model…');
     setupReadyCheck();
   } catch (err) {
     showError('Camera unavailable', cameraErrorMessage(err));
@@ -372,127 +448,349 @@ async function initCamera() {
     return;
   }
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
     audio: false,
   });
   video.srcObject = stream;
   await video.play();
 }
 
+/* ---------- Tracking pipeline (lag fix) ----------
+   Old: detectForVideo ran synchronously inside the rAF loop, so a slow
+   CPU inference frame stalled rendering → the whole game felt laggy.
+   New: the main thread only snapshots the video into an ImageBitmap
+   (async, cheap) and transfers it to hand-worker.js, which owns the
+   HandLandmarker. Results come back as messages and are consumed on
+   the next animation frame — inference can never block the render.
+   If the worker path is unavailable, we fall back to the old
+   synchronous main-thread landmarker. */
+
+let trackingWorker = null;
+let workerReady = false;        // worker landmarker initialized
+let workerDead = false;         // worker failed permanently → use sync fallback
+let bitmapInFlight = false;     // one frame snapshot in flight at a time
+let syncLandmarker = null;      // fallback: main-thread landmarker
+let syncLandmarkerPromise = null;
+let lastVideoTime = -1;
+let trackTs = 0;
+let latestTracking = null;      // newest worker result, consumed each rAF
+
+function initWorkerTracking() {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (ok, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      ok ? resolve() : reject(err || new Error('worker init failed'));
+    };
+    // Generous: first run downloads the wasm + model from the CDN.
+    const timeout = setTimeout(() => finish(false, new Error('hand-tracking worker timed out')), 25000);
+
+    try {
+      trackingWorker = new Worker('hand-worker.js', { type: 'module' });
+    } catch (err) {
+      finish(false, err);
+      return;
+    }
+
+    trackingWorker.onmessage = (e) => {
+      const m = e.data || {};
+      if (m.type === 'ready') {
+        workerReady = true;
+        setSetupProgress(0.9);
+        setupReadyCheck();
+        finish(true);
+      } else if (m.type === 'error') {
+        finish(false, new Error(m.message || 'worker error'));
+      } else if (m.type === 'result') {
+        bitmapInFlight = false;
+        latestTracking = m;
+      }
+    };
+    trackingWorker.onerror = () => {
+      workerDead = true;
+      workerReady = false;
+      finish(false, new Error('worker crashed'));
+    };
+
+    trackingWorker.postMessage({ type: 'init' });
+  });
+}
+
 async function initHandModel() {
-  if (TEST_MODE) { landmarker = { fake: true }; return; }
-  setSetupProgress(0.15);
+  if (TEST_MODE) return;
+
+  // Preferred path: off-thread inference.
+  try {
+    setSetupProgress(0.15);
+    await initWorkerTracking();
+    return;
+  } catch { /* fall through to the synchronous path */ }
+  if (trackingWorker) { try { trackingWorker.terminate(); } catch { /* ignore */ } trackingWorker = null; }
+
+  // Fallback: original main-thread landmarker (blocks per frame, but works).
+  setSetupProgress(0.3);
   visionModule = await import(/* @vite-ignore */ MP_BUNDLE);
-  setSetupProgress(0.45);
+  setSetupProgress(0.55);
   const fileset = await visionModule.FilesetResolver.forVisionTasks(MP_WASM);
-  setSetupProgress(0.65);
+  setSetupProgress(0.75);
+  syncLandmarker = await createSyncLandmarker(fileset);
+  setSetupProgress(0.9);
+}
+
+async function createSyncLandmarker(fileset) {
   const make = (delegate) => visionModule.HandLandmarker.createFromOptions(fileset, {
     baseOptions: { modelAssetPath: MP_MODEL, delegate },
     runningMode: 'VIDEO',
-    numHands: 1,
+    numHands: 2,
     minHandDetectionConfidence: 0.5,
     minHandPresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,
   });
   try {
-    landmarker = await make('GPU');
+    return await make('GPU');
   } catch {
-    landmarker = await make('CPU');   // GPU unsupported (some iOS) → CPU
+    return await make('CPU');   // GPU unsupported (some iOS) → CPU
   }
-  setSetupProgress(0.9);
 }
 
-// Called once per animation frame.
-let lastVideoTime = -1;
-
-function detectFrame(nowMs) {
-  if (state.fakeHand) {
-    // Test seam: pretend a hand is at the fake position.
-    state.hand.rawX = state.fakeHand.x;
-    state.hand.rawY = state.fakeHand.y;
-    state.hand.detected = true;
-    state.hand.lostMs = 0;
-    // (landmarks left untouched — capture.js may inject a fake skeleton)
-    if (!state.hand.everDetected) state.hand.everDetected = true;
-    setupReadyCheck();
-    return;
+// Lazily build a sync landmarker if the worker dies after succeeding.
+function ensureSyncLandmarker() {
+  if (syncLandmarker) return Promise.resolve(syncLandmarker);
+  if (!syncLandmarkerPromise) {
+    syncLandmarkerPromise = (async () => {
+      if (!visionModule) visionModule = await import(/* @vite-ignore */ MP_BUNDLE);
+      const fileset = await visionModule.FilesetResolver.forVisionTasks(MP_WASM);
+      syncLandmarker = await createSyncLandmarker(fileset);
+      return syncLandmarker;
+    })().catch(() => { syncLandmarkerPromise = null; return null; });
   }
-  if (!landmarker || landmarker.fake) return;
+  return syncLandmarkerPromise;
+}
+
+// Called once per animation frame: feed the tracker + consume results.
+function pumpTracking(nowMs) {
+  if (TEST_MODE) { applyFakeHands(); return; }
+
+  // Consume the newest worker result (never blocks — it's already done).
+  if (latestTracking) {
+    applyTracking(latestTracking.hands || [], nowMs);
+    latestTracking = null;
+  }
+
   if (!video || video.readyState < 2 || !video.videoWidth) return;
-  if (video.currentTime === lastVideoTime) return;   // no new frame yet
+  if (video.currentTime === lastVideoTime) return;   // no new camera frame yet
   lastVideoTime = video.currentTime;
 
+  if (workerReady && !bitmapInFlight && typeof createImageBitmap === 'function') {
+    bitmapInFlight = true;
+    createImageBitmap(video).then((bmp) => {
+      trackTs = Math.max(trackTs + 1, Math.floor(performance.now()));
+      trackingWorker.postMessage({ type: 'frame', bitmap: bmp, ts: trackTs }, [bmp]);
+    }).catch(() => { bitmapInFlight = false; });
+    return;
+  }
+
+  // Worker unavailable → synchronous main-thread inference (fallback).
+  if (!workerReady) {
+    if (syncLandmarker) {
+      runSyncDetection(nowMs);
+    } else if (workerDead) {
+      ensureSyncLandmarker().then((lm) => { if (lm) runSyncDetection(nowMs); });
+    }
+  }
+}
+
+function runSyncDetection(nowMs) {
   let result = null;
   try {
-    result = landmarker.detectForVideo(video, nowMs);
+    trackTs = Math.max(trackTs + 1, Math.floor(performance.now()));
+    result = syncLandmarker.detectForVideo(video, trackTs);
   } catch { return; }
+  const hands = [];
+  const lms = (result && result.landmarks) || [];
+  for (const lm of lms) hands.push(lm);
+  applyTracking(hands, nowMs);
+}
 
-  const lm = result && result.landmarks && result.landmarks[0];
-  if (lm) {
+// Test seam: pretend N hands are at fixed mirrored positions.
+function applyFakeHands() {
+  const slots = [state.hand, state.hand2];
+  const list = state.fakeHands;
+  for (let i = 0; i < slots.length; i++) {
+    const f = list && list[i];
+    if (f) {
+      const s = slots[i];
+      s.rawX = f.x; s.rawY = f.y;
+      s.detected = true;
+      s.lostMs = 0;
+      if (!s.everDetected) s.everDetected = true;
+      setupReadyCheck();
+    } else {
+      slots[i].detected = false;
+    }
+  }
+}
+
+// Distribute detected hands between player slots.
+//
+// Two-player rule: hands belong to whichever slot they were closest to
+// recently (greedy nearest-neighbor), so players can move freely without
+// their paddles swapping. Fresh sessions seed by position: leftmost hand
+// (in mirrored view) → P1, rightmost → P2.
+function applyTracking(hands, nowMs) {
+  // Build palm centroids (mirrored normalized coords).
+  const palms = [];
+  for (const lm of hands) {
+    if (!lm || lm.length < 21) continue;
     let sx = 0, sy = 0;
     for (const i of PALM_IDX) { sx += lm[i].x; sy += lm[i].y; }
     sx /= PALM_IDX.length; sy /= PALM_IDX.length;
-    state.hand.rawX = 1 - sx;          // mirror: your right = screen right
-    state.hand.rawY = sy;
-    state.hand.detected = true;
-    state.hand.lostMs = 0;
-    state.hand.landmarks = lm;
-    if (!state.hand.everDetected) state.hand.everDetected = true;
-    setupReadyCheck();
-  } else {
-    state.hand.detected = false;
-    state.hand.landmarks = null;
+    palms.push({ mx: 1 - sx, my: sy, lm });       // mirror x like the preview
+    if (palms.length >= 2) break;                  // two slots is all we need
   }
+
+  const slots = [state.hand, state.hand2];
+  const usedHand = [false, false];
+
+  if (!twoPlayer()) {
+    // Single player: keep whichever hand is nearest P1's previous spot.
+    const s = slots[0];
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < palms.length; i++) {
+      const d = Math.hypot(palms[i].mx - s.assignX, palms[i].my - s.assignY);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    assignPalm(s, best >= 0 ? palms[best] : null, nowMs);
+    slots[1].detected = false;
+    slots[1].landmarks = null;   // no ghost P2 skeleton in the PiP
+    return;
+  }
+
+  // Greedy match palms to recently-seen slots.
+  const pairs = [];
+  for (let si = 0; si < slots.length; si++) {
+    if (nowMs - slots[si].lastSeenMs > ASSIGN_MEMORY_MS) continue;
+    for (let pi = 0; pi < palms.length; pi++) {
+      if (usedHand[pi]) continue;
+      const d = Math.hypot(palms[pi].mx - slots[si].assignX, palms[pi].my - slots[si].assignY);
+      pairs.push({ d, si, pi });
+    }
+  }
+  pairs.sort((a, b) => a.d - b.d);
+  const slotTaken = [false, false];
+  for (const pr of pairs) {
+    if (slotTaken[pr.si] || usedHand[pr.pi]) continue;
+    slotTaken[pr.si] = true; usedHand[pr.pi] = true;
+    assignPalm(slots[pr.si], palms[pr.pi], nowMs);
+  }
+
+  // Remaining palms fill empty slots by position (leftmost → P1).
+  const freeSlots = [];
+  for (let si = 0; si < slots.length; si++) if (!slotTaken[si]) freeSlots.push(si);
+  const freePalms = [];
+  for (let pi = 0; pi < palms.length; pi++) if (!usedHand[pi]) freePalms.push(pi);
+  freePalms.sort((a, b) => palms[a].mx - palms[b].mx);
+  for (let k = 0; k < freePalms.length && k < freeSlots.length; k++) {
+    assignPalm(slots[freeSlots[k]], palms[freePalms[k]], nowMs);
+  }
+  for (const si of freeSlots.slice(freePalms.length)) {
+    slots[si].detected = false;
+    slots[si].landmarks = null;
+  }
+
+  if (palms.length === 0) {
+    for (const s of slots) { s.detected = false; s.landmarks = null; }
+  }
+}
+
+function assignPalm(slot, palm, nowMs) {
+  if (!palm) {
+    slot.detected = false;
+    slot.landmarks = null;      // don't leave a ghost skeleton in the PiP
+    return;
+  }
+  slot.rawX = palm.mx;
+  slot.rawY = palm.my;
+  slot.assignX = palm.mx;
+  slot.assignY = palm.my;
+  slot.lastSeenMs = nowMs;
+  slot.detected = true;
+  slot.lostMs = 0;
+  slot.landmarks = palm.lm;
+  if (!slot.everDetected) slot.everDetected = true;
+  setupReadyCheck();
 }
 
 /* ============================================================
-   8. HAND INPUT → 3D PADDLE
+   8. HAND INPUT → 3D PADDLES
    ============================================================ */
 
 function updateHandInput(dt) {
-  const hand = state.hand;
+  updateHandSlot(state.hand, 0, dt);
+  if (twoPlayer()) updateHandSlot(state.hand2, 1, dt);
+}
+
+function updateHandSlot(hand, idx, dt) {
+  const pl = idx === 0 ? state.player : state.p2;
 
   if (hand.detected) {
     hand.lostMs = 0;
-    // dt-adjusted exponential smoothing (framerate independent).
-    const a = 1 - Math.exp(-dt * SMOOTH_RATE);
+
+    // Speed-adaptive exponential smoothing (framerate independent):
+    // a slow hand is filtered hard (steady aim); a fast swing barely at
+    // all, so the paddle keeps up instead of lagging a beat behind.
+    const rawSpeed = dt > 0
+      ? Math.hypot(hand.rawX - hand.prevRawX, hand.rawY - hand.prevRawY) / dt
+      : 0;
+    hand.motion += (rawSpeed - hand.motion) * Math.min(1, dt * 14);
+    hand.prevRawX = hand.rawX;
+    hand.prevRawY = hand.rawY;
+    const rate = SMOOTH_SLOW + (SMOOTH_FAST - SMOOTH_SLOW) *
+      clampNum(hand.motion / ADAPT_REF_SPEED, 0, 1);
+    const a = 1 - Math.exp(-dt * rate);
     hand.smX += (hand.rawX - hand.smX) * a;
     hand.smY += (hand.rawY - hand.smY) * a;
 
-    // Map normalized hand position into the 3D paddle workspace.
+    // Map normalized hand position into the paddle workspace. P2 plays
+    // from the far rail watching a 180°-rotated view, so their x axis is
+    // flipped: moving your hand to *your* right moves your paddle to
+    // your right on screen.
     const nx = (hand.smX - HAND_X_MIN) / (HAND_X_MAX - HAND_X_MIN);
     const ny = (hand.smY - HAND_Y_MIN) / (HAND_Y_MAX - HAND_Y_MIN);
-    state.player.targetX = (Math.min(1.12, Math.max(-1.12, nx * 2 - 1))) * PADDLE_X_RANGE;
-    state.player.targetY = PADDLE_Y_TOP - Math.min(1, Math.max(0, ny)) * (PADDLE_Y_TOP - PADDLE_Y_BOT);
-    el['hand-hint'].classList.add('hidden');
+    const flip = idx === 1 ? -1 : 1;
+    pl.targetX = flip * Math.min(1.12, Math.max(-1.12, nx * 2 - 1)) * PADDLE_X_RANGE;
+    pl.targetY = PADDLE_Y_TOP - Math.min(1, Math.max(0, ny)) * (PADDLE_Y_TOP - PADDLE_Y_BOT);
   } else {
     hand.lostMs += dt * 1000;
-    if (hand.lostMs > HAND_LOST_MS && state.screen === 'play' && !state.paused) {
-      el['hand-hint'].classList.remove('hidden');
-    }
     // Paddle coasts: targets stay where they were.
   }
 
-  movePlayerPaddle(dt);
+  movePaddle(pl, idx === 0 ? pad1Keys : pad2Keys, dt);
 }
 
 function updateKeyboardInput(dt) {
-  const p = state.player;
-  const dx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
-  const dy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
-  p.targetX = p.x + dx * KEY_SPEED * dt;
-  p.targetY = p.y - dy * KEY_SPEED * dt;
-  el['hand-hint'].classList.add('hidden');
-  movePlayerPaddle(dt);
+  drivePaddleKeyboard(state.player, pad1Keys, dt);
+  if (twoPlayer()) drivePaddleKeyboard(state.p2, pad2Keys, dt);
 }
 
-function movePlayerPaddle(dt) {
-  const p = state.player;
+function drivePaddleKeyboard(p, keysPad, dt) {
+  const dx = (keysPad.right ? 1 : 0) - (keysPad.left ? 1 : 0);
+  const dy = (keysPad.down ? 1 : 0) - (keysPad.up ? 1 : 0);
+  // P2's view is rotated 180°, so their left/right keys flip in world x.
+  const flip = twoPlayer() && p === state.p2 ? -1 : 1;
+  p.targetX = p.x + flip * dx * KEY_SPEED * dt;
+  p.targetY = p.y - dy * KEY_SPEED * dt;
+  movePaddle(p, keysPad, dt);
+}
+
+function movePaddle(p, keysPad, dt) {
   const tx = Math.min(PADDLE_X_RANGE, Math.max(-PADDLE_X_RANGE, p.targetX));
   const ty = Math.min(PADDLE_Y_TOP, Math.max(PADDLE_Y_BOT, p.targetY));
 
   const prevX = p.x, prevY = p.y;
-  const a = 1 - Math.exp(-dt * 24);
+  const a = 1 - Math.exp(-dt * 32);
   p.x += (tx - p.x) * a;
   p.y += (ty - p.y) * a;
 
@@ -500,15 +798,36 @@ function movePlayerPaddle(dt) {
   if (dt > 0) {
     const ivx = (p.x - prevX) / dt;
     const ivy = (p.y - prevY) / dt;
-    p.vx += (ivx - p.vx) * Math.min(1, dt * 20);
-    p.vy += (ivy - p.vy) * Math.min(1, dt * 20);
+    p.vx += (ivx - p.vx) * Math.min(1, dt * 26);
+    p.vy += (ivy - p.vy) * Math.min(1, dt * 26);
   }
   let kb = 0;
-  if (keys.swing > 0) { kb = 2.6; keys.swing = Math.max(0, keys.swing - dt * 6); }
+  if (keysPad && keysPad.swing > 0) { kb = 2.6; keysPad.swing = Math.max(0, keysPad.swing - dt * 6); }
   p.speed = Math.max(Math.hypot(p.vx, p.vy), kb);
 
-  // Gentle forward lunge while swinging fast (visual only).
-  p.z = PADDLE_Z - Math.min(0.18, p.speed * 0.045);
+  // Gentle lunge toward the net while swinging fast (visual only).
+  const rail = p.railZ !== undefined ? p.railZ : PADDLE_Z;
+  const lunge = Math.min(0.18, p.speed * 0.045);
+  p.z = rail + (rail > 0 ? -lunge : lunge);
+}
+
+// Single place that shows/hides the "show your hand" nudge.
+function updateHandHints() {
+  let text = '';
+  if (state.inputMode === 'hand') {
+    const missing = [];
+    if (state.hand.lostMs > HAND_LOST_MS) missing.push(twoPlayer() ? 'P1' : '');
+    if (twoPlayer() && state.hand2.lostMs > HAND_LOST_MS) missing.push('P2');
+    if (missing.length) {
+      const names = missing.filter(Boolean).join(' & ');
+      text = names
+        ? `✋ ${names} — show your hand${missing.length > 1 ? 's' : ''} to the camera`
+        : '✋ Show your hand to the camera';
+    }
+  }
+  const show = text !== '' && state.screen === 'play' && !state.paused;
+  el['hand-hint'].classList.toggle('hidden', !show);
+  if (show) el['hand-hint'].textContent = text;
 }
 
 /* ============================================================
@@ -516,9 +835,9 @@ function movePlayerPaddle(dt) {
    ============================================================ */
 
 const world = {
-  renderer: null, scene: null, camera: null,
+  renderer: null, scene: null, camera: null, camera2: null,
   ball: null, ballShadow: null, trail: [],
-  playerPaddle: null, aiPaddle: null, opponent: null,
+  playerPaddle: null, p2Paddle: null, aiPaddle: null, opponent: null,
 };
 
 function initThree() {
@@ -537,10 +856,19 @@ function initThree() {
   world.camera.position.set(0, 1.72, 2.35);
   world.camera.lookAt(0, 0.78, -0.55);
 
+  // Second POV for two-player split screen: from the far end of the
+  // table looking back (rotated 180° around the table).
+  world.camera2 = new THREE.PerspectiveCamera(58, 1, 0.1, 60);
+  world.camera2.position.set(0, 1.72, PADDLE_Z_FAR - 1.2);
+  world.camera2.lookAt(0, 0.78, 0.55);
+
   buildArena(scene);
   buildTable(scene);
   buildBall(scene);
   world.playerPaddle = buildPaddle(scene, 0xe23b4e, true);
+  // Second near-rail paddle for two-player mode (hidden in single-player).
+  world.p2Paddle = buildPaddle(scene, 0x35a0ff, true);
+  world.p2Paddle.visible = false;
   world.aiPaddle = buildPaddle(scene, 0x1c1c22, false);
   buildOpponent(scene);
 }
@@ -589,6 +917,25 @@ function buildArena(scene) {
   const stripGreen = new THREE.Mesh(new THREE.BoxGeometry(5, 0.05, 0.05), new THREE.MeshBasicMaterial({ color: 0x35e08c }));
   stripGreen.position.set(0, 3.6, -6.95);
   scene.add(stripGreen);
+
+  // Mirror wall + strips behind P1's camera (they fill P2's split-screen
+  // POV, which looks the opposite way up the arena).
+  const wall2 = new THREE.Mesh(
+    new THREE.PlaneGeometry(24, 6),
+    new THREE.MeshStandardMaterial({ color: 0x0d1426, roughness: 1 })
+  );
+  wall2.position.set(0, 3, 7);
+  wall2.rotation.y = Math.PI;
+  scene.add(wall2);
+  const stripCyan2 = new THREE.Mesh(stripGeo, stripCyan.material);
+  stripCyan2.position.set(4.5, 2.6, 6.95);
+  scene.add(stripCyan2);
+  const stripPink2 = new THREE.Mesh(stripGeo, stripPink.material);
+  stripPink2.position.set(-4.5, 2.2, 6.95);
+  scene.add(stripPink2);
+  const stripGreen2 = new THREE.Mesh(stripGreen.geometry, stripGreen.material);
+  stripGreen2.position.set(0, 3.6, 6.95);
+  scene.add(stripGreen2);
 
   // Side barrier boards (like real TT surrounds)
   const boardMat = new THREE.MeshStandardMaterial({ color: 0x101a30, roughness: 0.9 });
@@ -812,14 +1159,38 @@ function resetMatch() {
   state.ai.reactT = 0;
   state.ai.x = 0; state.ai.targetX = 0;
   state.ai.y = 1.0; state.ai.targetY = 1.0;
+  // P1 on the near rail, P2 on the far rail (two-player).
+  state.player.x = 0; state.player.targetX = 0;
+  state.player.y = 1.1; state.player.targetY = 1.1;
+  state.player.z = PADDLE_Z;
+  state.player.vx = state.player.vy = 0; state.player.speed = 0;
+  state.player.hitCooldown = 0;
+  state.p2.x = 0; state.p2.targetX = 0;
+  state.p2.y = 1.0; state.p2.targetY = 1.0;
+  state.p2.z = PADDLE_Z_FAR;
+  state.p2.vx = state.p2.vy = 0; state.p2.speed = 0;
+  state.p2.hitCooldown = 0;
+}
+
+// The AI figure only exists in single-player mode.
+function syncOpponentVisibility() {
+  if (world.opponent) world.opponent.visible = !twoPlayer();
 }
 
 function startMatch() {
   resetMatch();
+  syncOpponentVisibility();
+  syncScoreLabels();
   showScreen('play');
   state.phase = 'countdown';
   state.timer = COUNTDOWN_STEP * 3;
   state.lastCountdown = -1;
+}
+
+function syncScoreLabels() {
+  if (!el['score-label-you']) return;
+  el['score-label-you'].textContent = twoPlayer() ? 'P1' : 'YOU';
+  el['score-label-ai'].textContent = twoPlayer() ? 'P2' : 'AI';
 }
 
 function currentServer() {
@@ -829,6 +1200,16 @@ function currentServer() {
   }
   const block = Math.floor(total / 2) % 2;      // blocks of 2, starting with player
   return block === 0 ? 'you' : 'ai';
+}
+
+// Banner text for whoever is about to serve.
+function showServeBanner() {
+  if (state.serveSide === 'you') {
+    showBanner(twoPlayer() ? "Player 1's serve" : 'Your serve', 'Swipe through the ball to launch it');
+  } else {
+    showBanner(twoPlayer() ? "Player 2's serve" : 'AI serve',
+      twoPlayer() ? 'Swipe through the ball to launch it' : 'Get ready…');
+  }
 }
 
 function beginServe() {
@@ -843,43 +1224,41 @@ function beginServe() {
   b.validOpponentBounce = false;
   b.visible = true;
   updateServeChip();
-  if (state.serveSide === 'you') {
-    showBanner('Your serve', 'Swipe through the ball to launch it');
-  } else {
-    showBanner('AI serve', 'Get ready…');
-  }
+  showServeBanner();
 }
 
-function launchPlayerServe() {
+// The paddle that is currently serving.
+function serverPaddle() {
+  if (state.serveSide === 'you') return state.player;
+  return twoPlayer() ? state.p2 : state.ai;
+}
+
+// Unified serve launch for all three cases (P1 / P2 / AI).
+function launchServe() {
   const b = state.ball;
-  const p = state.player;
-  const power = Math.min(3.5, 2.2 + p.speed * 0.35);
-  const aimX = clampNum(p.vx * 0.14 + (Math.random() - 0.5) * 0.35, -0.62, 0.62);
-  const v = solveShot({ x: b.x, y: b.y, z: b.z }, { x: aimX, y: TABLE.H + BALL_R, z: -(0.45 + Math.random() * 0.7) }, power);
+  const sp = serverPaddle();
+  const aiControlled = state.serveSide === 'ai' && !twoPlayer();
+  const cfg = DIFFICULTY[state.difficulty];
+
+  const power = aiControlled
+    ? cfg.returnSpeed - 0.3
+    : Math.min(3.5, 2.2 + sp.speed * 0.35);
+  const aimX = aiControlled
+    ? clampNum((Math.random() - 0.5) * 1.0, -0.62, 0.62)
+    : clampNum(sp.vx * 0.14 + (Math.random() - 0.5) * 0.35, -0.62, 0.62);
+  // Land on the receiver's half of the table (opposite side of the net).
+  const dir = sp.z > 0 ? -1 : 1;
+  const targetZ = dir * (0.5 + Math.random() * 0.7);
+
+  const v = solveShot({ x: b.x, y: b.y, z: b.z }, { x: aimX, y: TABLE.H + BALL_R, z: targetZ }, power);
   b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
-  b.lastHitter = 'you';
+  b.lastHitter = state.serveSide;      // 'you' | 'ai'
   b.bounces = 0;
   b.validOpponentBounce = false;
   state.phase = 'rally';
   state.rally = 1;
   hideBanner();
   hitSound(power);
-}
-
-function launchAiServe() {
-  const b = state.ball;
-  const cfg = DIFFICULTY[state.difficulty];
-  const aimX = (Math.random() - 0.5) * 1.0;
-  const v = solveShot({ x: b.x, y: b.y, z: b.z },
-    { x: aimX, y: TABLE.H + BALL_R, z: 0.5 + Math.random() * 0.7 }, cfg.returnSpeed - 0.3);
-  b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
-  b.lastHitter = 'ai';
-  b.bounces = 0;
-  b.validOpponentBounce = false;
-  state.phase = 'rally';
-  state.rally = 1;
-  hideBanner();
-  hitSound(cfg.returnSpeed);
 }
 
 function scorePoint(winner) {
@@ -891,11 +1270,11 @@ function scorePoint(winner) {
   state.timer = POINT_TIME;
 
   if (winner === 'you') {
-    showBanner('Your point!', `${state.scoreYou} : ${state.scoreAI}`, 'you');
+    showBanner(twoPlayer() ? 'Point Player 1!' : 'Your point!', `${state.scoreYou} : ${state.scoreAI}`, 'you');
     blip(660, 0.09, 'sine', 0.07);
     setTimeout(() => blip(880, 0.12, 'sine', 0.07), 90);
   } else {
-    showBanner('AI point', `${state.scoreYou} : ${state.scoreAI}`, 'ai');
+    showBanner(twoPlayer() ? 'Point Player 2!' : 'AI point', `${state.scoreYou} : ${state.scoreAI}`, 'ai');
     blip(330, 0.1, 'sine', 0.06);
     setTimeout(() => blip(247, 0.14, 'sine', 0.06), 100);
   }
@@ -914,21 +1293,31 @@ function afterPoint() {
 function endMatch(winner) {
   state.phase = 'over';
   state.longestRally = Math.max(state.longestRally, state.rally);
-  if (state.longestRally > state.stats.bestRally) state.stats.bestRally = state.longestRally;
-  if (winner === 'you') state.stats.wins++; else state.stats.losses++;
-  saveGame();
+  if (state.longestRally > state.stats.bestRally) {
+    state.stats.bestRally = state.longestRally;
+    saveGame();
+  }
+  // Wins/losses are a "you vs AI" record — two-player matches don't touch them.
+  if (!twoPlayer()) {
+    if (winner === 'you') state.stats.wins++; else state.stats.losses++;
+    saveGame();
+  }
 
   const you = state.scoreYou, ai = state.scoreAI;
-  el['gameover-emoji'].textContent = winner === 'you' ? '🏆' : '🤖';
-  el['gameover-title'].textContent = winner === 'you' ? 'You win!' : 'AI wins';
+  el['gameover-emoji'].textContent = (winner === 'you' || twoPlayer()) ? '🏆' : '🤖';
+  el['gameover-title'].textContent = twoPlayer()
+    ? `${sideLabel(winner)} wins!`
+    : (winner === 'you' ? 'You win!' : 'AI wins');
   el['gameover-title'].className = winner === 'you' ? 'win' : 'lose';
   el['gameover-score'].textContent = `${you} : ${ai}`;
   el['gameover-rally'].textContent = state.longestRally;
-  el['gameover-diff'].textContent = DIFFICULTY[state.difficulty].label;
+  el['gameover-diff'].textContent = twoPlayer() ? '2 Players' : DIFFICULTY[state.difficulty].label;
   hideBanner();
   showScreen('play');   // reveals the game-over overlay
 
-  if (winner === 'you') {
+  // Both players are human in 2p — always celebrate.
+  const celebrate = winner === 'you' || twoPlayer();
+  if (celebrate) {
     spawnConfetti();
     [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => blip(f, 0.16, 'triangle', 0.07), i * 130));
   } else {
@@ -937,7 +1326,9 @@ function endMatch(winner) {
 }
 
 function updateServeChip() {
-  el['serve-chip'].textContent = state.serveSide === 'you' ? 'Your serve' : 'AI serve';
+  el['serve-chip'].textContent = state.serveSide === 'you'
+    ? (twoPlayer() ? 'P1 serve' : 'Your serve')
+    : (twoPlayer() ? 'P2 serve' : 'AI serve');
 }
 
 function clampNum(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
@@ -1064,31 +1455,54 @@ function stepBall(dt, scoring) {
    13. PLAYER HITTING
    ============================================================ */
 
+// The human-controlled paddles: P1 always; P2 joins in two-player,
+// playing from the FAR rail (opposite ends, like real table tennis).
+function nearSidePaddles() {
+  return twoPlayer() ? [state.player, state.p2] : [state.player];
+}
+
 function stepPlayerHit(dt) {
-  const p = state.player;
-  p.hitCooldown = Math.max(0, p.hitCooldown - dt);
+  const b = state.ball;
+  if (state.phase !== 'rally' || !b.visible) return;
+
+  for (const pl of nearSidePaddles()) {
+    pl.hitCooldown = Math.max(0, pl.hitCooldown - dt);
+  }
+
+  for (const pl of nearSidePaddles()) {
+    if (b.lastHitter === pl.id || pl.hitCooldown > 0) continue;
+    // The ball must be on this paddle's side of the net
+    // (P1 defends z > 0, P2 defends z < 0).
+    if (pl.z > 0 ? b.z < 0.22 : b.z > -0.22) continue;
+    const dist = Math.hypot(b.x - pl.x, b.y - pl.y, b.z - pl.z);
+    if (dist > PADDLE_REACH) continue;
+    playerReturn(pl);
+    break;                                             // one contact per step
+  }
+}
+
+function playerReturn(pl) {
   const b = state.ball;
 
-  if (state.phase !== 'rally' || b.lastHitter === 'you' || p.hitCooldown > 0) return;
-  if (b.z < 0.22) return;                              // must be on your side of the net
-
-  const dist = Math.hypot(b.x - p.x, b.y - p.y, b.z - p.z);
-  if (dist > PADDLE_REACH) return;
-
   // Contact! Aim the return using swing direction + a little randomness.
-  const swing = Math.min(4, p.speed);
+  const swing = Math.min(4, pl.speed);
   const speed = clampNum(2.3 + state.rally * 0.08 + swing * 0.45, 2.3, 6.2);
-  const aimX = clampNum(p.vx * 0.16 + (Math.random() - 0.5) * 0.3, -0.68, 0.68);
-  const aimZ = -(0.45 + Math.random() * 0.8);
+  const aimX = clampNum(pl.vx * 0.16 + (Math.random() - 0.5) * 0.3, -0.68, 0.68);
+  // Aim at the opponent's half: P1 shoots toward −z, P2 toward +z.
+  const dir = pl.z > 0 ? -1 : 1;
+  const aimZ = dir * (0.45 + Math.random() * 0.8);
   const v = solveShot({ x: b.x, y: b.y, z: b.z }, { x: aimX, y: TABLE.H + BALL_R, z: aimZ }, speed);
   b.vx = v.vx; b.vy = v.vy; b.vz = v.vz;
-  b.lastHitter = 'you';
+  b.lastHitter = pl.id;
   b.bounces = 0;
   b.validOpponentBounce = false;
   state.rally++;
-  p.hitCooldown = 0.3;
-  state.ai.reactT = DIFFICULTY[state.difficulty].react;
-  state.ai.aimErrX = 0; state.ai.aimErrZ = 0;
+  pl.hitCooldown = 0.3;
+  if (!twoPlayer()) {
+    // Only the bot needs a reaction delay + fresh aim error.
+    state.ai.reactT = DIFFICULTY[state.difficulty].react;
+    state.ai.aimErrX = 0; state.ai.aimErrZ = 0;
+  }
   hitSound(speed);
   if (navigator.vibrate) { try { navigator.vibrate(12); } catch { /* ignore */ } }
 }
@@ -1102,6 +1516,7 @@ function hitSound(speed) {
    ============================================================ */
 
 function stepAI(dt) {
+  if (twoPlayer()) return;               // no bot on the far side in 2-player
   const cfg = DIFFICULTY[state.difficulty];
   const ai = state.ai;
   const b = state.ball;
@@ -1193,19 +1608,32 @@ function renderScene(dt) {
   const p = state.player;
   const b = state.ball;
 
-  // Player paddle follows the smoothed targets; tilt with the swing.
+  // Player paddles follow the smoothed targets; tilt with the swing.
   const pp = world.playerPaddle;
   pp.position.set(p.x, p.y, p.z);
   pp.rotation.z = clampNum(-p.vx * 0.05, -0.5, 0.5);
   pp.rotation.x = 0.12 + clampNum(p.vy * 0.04, -0.35, 0.35);
 
-  // AI paddle.
+  if (world.p2Paddle) {
+    world.p2Paddle.visible = twoPlayer();
+    if (twoPlayer()) {
+      const q = state.p2;
+      world.p2Paddle.position.set(q.x, q.y, q.z);
+      world.p2Paddle.rotation.z = clampNum(-q.vx * 0.05, -0.5, 0.5);
+      world.p2Paddle.rotation.x = 0.12 + clampNum(q.vy * 0.04, -0.35, 0.35);
+    }
+  }
+
+  // AI paddle (single-player only).
   const ap = world.aiPaddle;
-  ap.position.set(state.ai.x, state.ai.y, state.ai.z);
-  ap.rotation.z = clampNum(state.ai.vx * 0.04, -0.4, 0.4);
+  ap.visible = !twoPlayer();
+  if (!twoPlayer()) {
+    ap.position.set(state.ai.x, state.ai.y, state.ai.z);
+    ap.rotation.z = clampNum(state.ai.vx * 0.04, -0.4, 0.4);
+  }
 
   // Opponent leans toward the ball.
-  if (world.opponent) {
+  if (world.opponent && world.opponent.visible) {
     world.opponent.position.x += (clampNum(b.x * 0.3, -0.7, 0.7) - world.opponent.position.x) * Math.min(1, dt * 4);
     world.opponent.position.y = Math.sin(performance.now() * 0.0016) * 0.02;
   }
@@ -1237,15 +1665,48 @@ function renderScene(dt) {
     else t.visible = false;
   }
 
-  // Subtle camera sway with the paddle.
-  world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
-  world.camera.lookAt(0, 0.78, -0.55);
+  // Camera sway follows each player's own paddle, then draw.
+  // Two-player: split screen — left half is P1's POV from the near end,
+  // right half is P2's POV from the far end (180° around the table).
+  const r = world.renderer;
+  if (twoPlayer() && world.camera2) {
+    world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
+    world.camera.lookAt(0, 0.78, -0.55);
+    world.camera2.position.x += (state.p2.x * 0.09 - world.camera2.position.x) * Math.min(1, dt * 5);
+    world.camera2.lookAt(0, 0.78, 0.55);
 
-  world.renderer.render(world.scene, world.camera);
+    const hw = Math.floor(view.w / 2);
+    const aspect = hw / view.h;
+    if (world.camera.aspect !== aspect) { world.camera.aspect = aspect; world.camera.updateProjectionMatrix(); }
+    if (world.camera2.aspect !== aspect) { world.camera2.aspect = aspect; world.camera2.updateProjectionMatrix(); }
+
+    r.setScissorTest(true);
+    r.setViewport(0, 0, hw, view.h);
+    r.setScissor(0, 0, hw, view.h);
+    r.render(world.scene, world.camera);
+    r.setViewport(hw, 0, view.w - hw, view.h);
+    r.setScissor(hw, 0, view.w - hw, view.h);
+    r.render(world.scene, world.camera2);
+    r.setScissorTest(false);
+  } else {
+    const aspect = view.w / view.h;
+    if (world.camera.aspect !== aspect) { world.camera.aspect = aspect; world.camera.updateProjectionMatrix(); }
+    world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
+    world.camera.lookAt(0, 0.78, -0.55);
+    r.setViewport(0, 0, view.w, view.h);
+    r.render(world.scene, world.camera);
+  }
 }
 
-// Picture-in-picture camera preview with hand skeleton.
+// Picture-in-picture camera preview with hand skeletons.
+// Redrawn at most ~30fps — the 3D view is the star; the PiP is a mirror.
+let lastPreviewDraw = 0;
+
 function drawPreview() {
+  const nowMs = performance.now();
+  if (nowMs - lastPreviewDraw < PREVIEW_INTERVAL_MS) return;
+  lastPreviewDraw = nowMs;
+
   const pc = previewCtx;
   const W = el.preview.width, H = el.preview.height;
   pc.fillStyle = '#05070d';
@@ -1254,20 +1715,42 @@ function drawPreview() {
   const feed = TEST_MODE ? state.fakeBackground : null;
   const liveVideo = !TEST_MODE && video && video.readyState >= 2 && video.videoWidth ? video : null;
 
+  // Two-player: the preview splits down the middle — left half is P1's
+  // region of the (mirrored) feed, right half is P2's.
+  const split = twoPlayer();
+
   if (feed || liveVideo) {
     const src = feed || liveVideo;
     const sw = feed ? feed.width : liveVideo.videoWidth;
     const sh = feed ? feed.height : liveVideo.videoHeight;
-    pc.save();
-    pc.translate(W, 0);
-    pc.scale(-1, 1);                       // mirrored, like a mirror
     const s = Math.max(W / sw, H / sh);
-    pc.drawImage(src, (W - sw * s) / 2, (H - sh * s) / 2, sw * s, sh * s);
-    pc.restore();
 
-    const lm = state.hand.landmarks;
-    if (lm) {
-      pc.strokeStyle = 'rgba(77, 215, 255, 0.85)';
+    const drawFeed = (cx0, cw) => {
+      pc.save();
+      pc.beginPath();
+      pc.rect(cx0, 0, cw, H);
+      pc.clip();
+      pc.translate(W, 0);
+      pc.scale(-1, 1);                       // mirrored, like a mirror
+      pc.drawImage(src, (W - sw * s) / 2, (H - sh * s) / 2, sw * s, sh * s);
+      pc.restore();
+    };
+    if (split) { drawFeed(0, W / 2); drawFeed(W / 2, W - W / 2); }
+    else drawFeed(0, W);
+
+    // Skeletons — in split mode each half shows only its own player.
+    const halves = split
+      ? [[state.hand, 0, W / 2], [state.hand2, W / 2, W - W / 2]]
+      : [[state.hand, 0, W], [state.hand2, 0, W]];
+    for (const [slot, cx0, cw] of halves) {
+      const lm = slot.landmarks;
+      if (!lm) continue;
+      const color = slot === state.hand2 ? 'rgba(255, 141, 77, 0.9)' : 'rgba(77, 215, 255, 0.85)';
+      pc.save();
+      pc.beginPath();
+      pc.rect(cx0, 0, cw, H);
+      pc.clip();
+      pc.strokeStyle = color;
       pc.lineWidth = 2;
       pc.lineCap = 'round';
       for (const [a, bIdx] of HAND_CONNECTIONS) {
@@ -1276,12 +1759,26 @@ function drawPreview() {
         pc.lineTo((1 - lm[bIdx].x) * W, lm[bIdx].y * H);
         pc.stroke();
       }
-      pc.fillStyle = 'rgba(77, 215, 255, 0.95)';
+      pc.fillStyle = color;
       for (const pt of lm) {
         pc.beginPath();
         pc.arc((1 - pt.x) * W, pt.y * H, 3, 0, Math.PI * 2);
         pc.fill();
       }
+      pc.restore();
+    }
+
+    if (split) {
+      // Divider between the two players' regions + name tags.
+      pc.fillStyle = 'rgba(238, 243, 255, 0.3)';
+      pc.fillRect(W / 2 - 1, 0, 2, H);
+      pc.font = '700 12px Inter, sans-serif';
+      pc.textAlign = 'left';
+      pc.fillStyle = 'rgba(53, 224, 140, 0.95)';
+      pc.fillText('P1', 8, 17);
+      pc.textAlign = 'right';
+      pc.fillStyle = 'rgba(255, 141, 77, 0.95)';
+      pc.fillText('P2', W - 8, 17);
     }
   } else {
     pc.fillStyle = '#9fb0d0';
@@ -1457,22 +1954,25 @@ function togglePause(force) {
     hideBanner();
     blip(300, 0.06, 'sine', 0.04);
   } else {
-    if (state.phase === 'serve' && state.serveSide === 'you') {
-      showBanner('Your serve', 'Swipe through the ball to launch it');
-    }
+    if (state.phase === 'serve') showServeBanner();
     blip(500, 0.06, 'sine', 0.04);
   }
 }
 
 function startKeyboardMode() {
   state.inputMode = 'keyboard';
-  toast('Keyboard mode — arrows move, Space swings');
+  toast(twoPlayer()
+    ? '2P keyboard — P1: WASD + Space · P2: Arrows + Enter'
+    : 'Keyboard mode — arrows move, Space swings');
   startMatch();
 }
 
 function wireControls() {
   // Intro
   el['btn-start'].addEventListener('click', () => { ensureAudio(); goToSetup(); });
+  for (const btn of el['mode-seg'].querySelectorAll('button')) {
+    btn.addEventListener('click', () => { ensureAudio(); setMode(btn.dataset.mode); });
+  }
   for (const btn of el['difficulty-seg'].querySelectorAll('button')) {
     btn.addEventListener('click', () => setDifficulty(btn.dataset.diff));
   }
@@ -1500,25 +2000,39 @@ function wireControls() {
   el['btn-change-diff'].addEventListener('click', goToIntro);
   el['btn-menu'].addEventListener('click', goToIntro);
 
-  // Keyboard
+  // Keyboard — pad1: WASD + Space (P1), pad2: Arrows + Enter (P2).
+  // In single-player the arrows merge into pad1 so either works for P1.
   window.addEventListener('keydown', (e) => {
     const k = e.key;
-    if (k === 'ArrowLeft' || k === 'a') { keys.left = true; e.preventDefault(); }
-    else if (k === 'ArrowRight' || k === 'd') { keys.right = true; e.preventDefault(); }
-    else if (k === 'ArrowUp' || k === 'w') { keys.up = true; e.preventDefault(); }
-    else if (k === 'ArrowDown' || k === 's') { keys.down = true; e.preventDefault(); }
-    else if (k === ' ') { keys.swing = 1; e.preventDefault(); }
+    const merge = !twoPlayer();
+    if (k === 'ArrowLeft') { pad2Keys.left = true; if (merge) pad1Keys.left = true; e.preventDefault(); }
+    else if (k === 'ArrowRight') { pad2Keys.right = true; if (merge) pad1Keys.right = true; e.preventDefault(); }
+    else if (k === 'ArrowUp') { pad2Keys.up = true; if (merge) pad1Keys.up = true; e.preventDefault(); }
+    else if (k === 'ArrowDown') { pad2Keys.down = true; if (merge) pad1Keys.down = true; e.preventDefault(); }
+    else if (k === 'a' || k === 'A') { pad1Keys.left = true; }
+    else if (k === 'd' || k === 'D') { pad1Keys.right = true; }
+    else if (k === 'w' || k === 'W') { pad1Keys.up = true; }
+    else if (k === 's' || k === 'S') { pad1Keys.down = true; }
+    else if (k === ' ') { pad1Keys.swing = 1; e.preventDefault(); }
+    else if (k === 'Enter') { pad2Keys.swing = 1; e.preventDefault(); }
     else if (k === 'p' || k === 'P' || k === 'Escape') togglePause();
   });
   window.addEventListener('keyup', (e) => {
     const k = e.key;
-    if (k === 'ArrowLeft' || k === 'a') keys.left = false;
-    else if (k === 'ArrowRight' || k === 'd') keys.right = false;
-    else if (k === 'ArrowUp' || k === 'w') keys.up = false;
-    else if (k === 'ArrowDown' || k === 's') keys.down = false;
+    const merge = !twoPlayer();
+    if (k === 'ArrowLeft') { pad2Keys.left = false; if (merge) pad1Keys.left = false; }
+    else if (k === 'ArrowRight') { pad2Keys.right = false; if (merge) pad1Keys.right = false; }
+    else if (k === 'ArrowUp') { pad2Keys.up = false; if (merge) pad1Keys.up = false; }
+    else if (k === 'ArrowDown') { pad2Keys.down = false; if (merge) pad1Keys.down = false; }
+    else if (k === 'a' || k === 'A') { pad1Keys.left = false; }
+    else if (k === 'd' || k === 'D') { pad1Keys.right = false; }
+    else if (k === 'w' || k === 'W') { pad1Keys.up = false; }
+    else if (k === 's' || k === 'S') { pad1Keys.down = false; }
   });
   window.addEventListener('blur', () => {
-    keys.left = keys.right = keys.up = keys.down = false;
+    for (const kp of [pad1Keys, pad2Keys]) {
+      kp.left = kp.right = kp.up = kp.down = false;
+    }
   });
 
   // Auto-pause when the tab is hidden.
@@ -1538,9 +2052,9 @@ function wireControls() {
 let lastTs = 0;
 
 function update(dt, nowMs) {
-  detectFrame(nowMs);
+  pumpTracking(nowMs);
 
-  // Paddle follows the hand on the setup screen too (live preview).
+  // Paddles follow hands on the setup screen too (live preview).
   if (state.screen === 'setup') {
     if (state.inputMode === 'hand') updateHandInput(dt);
     return;
@@ -1549,34 +2063,39 @@ function update(dt, nowMs) {
 
   if (state.inputMode === 'hand') updateHandInput(dt);
   else updateKeyboardInput(dt);
+  updateHandHints();
 
   if (state.phase === 'countdown') {
     state.timer -= dt;
     const n = Math.max(1, Math.ceil(state.timer / COUNTDOWN_STEP));
     if (n !== state.lastCountdown) {
       state.lastCountdown = n;
-      showBanner(String(n), 'First to 11 — win by 2');
+      showBanner(String(n), twoPlayer() ? 'P1 vs P2 — first to 11' : 'First to 11 — win by 2');
       blip(440, 0.05, 'sine', 0.045);
     }
     if (state.timer <= 0) beginServe();
   } else if (state.phase === 'serve') {
     state.serveTimer += dt;
     const b = state.ball;
-    if (state.serveSide === 'you') {
-      // Ball floats beside your paddle until you swipe it.
-      b.x = state.player.x - 0.13;
-      b.y = state.player.y + 0.06;
-      b.z = state.player.z - 0.2;
+    const aiServing = state.serveSide === 'ai' && !twoPlayer();
+    if (!aiServing) {
+      // Human server (P1 or P2): the ball floats beside their paddle
+      // until they swipe through it.
+      const sp = serverPaddle();
+      const side = sp === state.player ? -0.13 : 0.13;   // float on the outside
+      b.x = sp.x + side;
+      b.y = sp.y + 0.06;
+      b.z = sp.z + (sp.z > 0 ? -0.2 : 0.2);              // float toward the net
       b.visible = true;
-      if (state.player.speed > 1.15 || state.serveTimer > AUTO_SERVE_S) launchPlayerServe();
+      if (sp.speed > 1.15 || state.serveTimer > AUTO_SERVE_S) launchServe();
     } else {
       // AI holds the ball, then serves.
+      stepAI(dt);
       b.x = state.ai.x + 0.12;
       b.y = state.ai.y + 0.06;
       b.z = state.ai.z + 0.18;
       b.visible = true;
-      stepAI(dt);
-      if (state.serveTimer > AI_SERVE_DELAY) launchAiServe();
+      if (state.serveTimer > AI_SERVE_DELAY) launchServe();
     }
   } else if (state.phase === 'rally') {
     stepPlayerHit(dt);
@@ -1609,21 +2128,25 @@ window.__airsmash = {
   TABLE,
   view,
   get renderer() { return world.renderer; },
+  get camera() { return world.camera; },
+  get camera2() { return world.camera2; },
   // Place a fake hand (normalized, mirrored coords: x 0..1 left→right, y 0..1 top→bottom).
-  setFakeHand(x, y) { state.fakeHand = { x, y }; },
-  clearFakeHand() { state.fakeHand = null; },
+  // Feeds player 1's hand slot.
+  setFakeHand(x, y) { state.fakeHands = [{ x, y }]; },
+  // Fake N hands at once: index 0 → P1, index 1 → P2 (two-player mode).
+  setFakeHands(list) { state.fakeHands = list; },
+  clearFakeHand() { state.fakeHands = null; },
   // Fake hand skeleton for screenshots (unmirrored landmark-style points).
-  setFakeLandmarks(pts) { state.hand.landmarks = pts; },
+  // Optional second arg selects the slot (default 0 = P1).
+  setFakeLandmarks(pts, slot = 0) {
+    (slot === 1 ? state.hand2 : state.hand).landmarks = pts;
+  },
   // Simulated camera feed for screenshots (an offscreen canvas).
   setFakeBackground(canvas) { state.fakeBackground = canvas; },
   // End the match-start countdown immediately.
   skipCountdown() { if (state.phase === 'countdown') state.timer = 0; },
   // Launch the current serve immediately (whichever side).
-  serveNow() {
-    if (state.phase !== 'serve') return;
-    if (state.serveSide === 'you') launchPlayerServe();
-    else launchAiServe();
-  },
+  serveNow() { if (state.phase === 'serve') launchServe(); },
   // Award a point as if the rally had ended that way.
   forceScore(side) {
     if (state.phase === 'over' || state.phase === 'point') return;
@@ -1671,9 +2194,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   layout();
   loadGame();
+  setMode(state.mode);
   setDifficulty(state.difficulty);
   syncSoundBtn();
   refreshIntroStats();
+  syncOpponentVisibility();
   wireControls();
   showScreen('intro');
   requestAnimationFrame(frame);

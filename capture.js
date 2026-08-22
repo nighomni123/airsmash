@@ -43,7 +43,7 @@ const FAKE_LANDMARKS = [
   [0.440, 0.680], [0.450, 0.620], [0.455, 0.580], [0.460, 0.550], // pinky
 ];
 
-async function installFakeScene(page) {
+async function installFakeScene(page, { twoPlayers = false } = {}) {
   // Simulated camera feed: a soft, warm living-room blur.
   await page.evaluate(() => {
     const cv = document.createElement('canvas');
@@ -70,9 +70,22 @@ async function installFakeScene(page) {
     c.fillRect(250, 330, 120, 150);
     window.__airsmash.setFakeBackground(cv);
   });
+
+  if (!twoPlayers) {
+    await page.evaluate((lm) => {
+      window.__airsmash.setFakeLandmarks(lm.map(([x, y]) => ({ x, y })));
+      window.__airsmash.setFakeHand(0.608, 0.69);
+    }, FAKE_LANDMARKS);
+    return;
+  }
+
+  // Two hands: P1 on the mirrored-left, P2 on the mirrored-right.
   await page.evaluate((lm) => {
-    window.__airsmash.setFakeLandmarks(lm.map(([x, y]) => ({ x, y })));
-    window.__airsmash.setFakeHand(0.608, 0.69);
+    const pts = lm.map(([x, y]) => ({ x, y }));
+    const p1 = lm.map(([x, y]) => ({ x: x + 0.30, y }));   // shifted → appears left when mirrored
+    window.__airsmash.setFakeLandmarks(p1, 0);
+    window.__airsmash.setFakeLandmarks(pts, 1);
+    window.__airsmash.setFakeHands([{ x: 0.31, y: 0.66 }, { x: 0.61, y: 0.70 }]);
   }, FAKE_LANDMARKS);
 }
 
@@ -136,6 +149,30 @@ async function captureScreenshots() {
     await page.waitForTimeout(500);   // catch confetti mid-flight
     await page.screenshot({ path: path.join(OUT, 'gameover.png') });
     console.log('saved gameover.png');
+
+    // 6. Two-player mode — two hands, two paddles, mid rally
+    await page.click('#btn-menu');
+    await page.waitForTimeout(400);
+    await page.click('#mode-seg button[data-mode="2p"]');
+    await page.waitForTimeout(200);
+    await page.click('#btn-start');
+    await page.waitForTimeout(400);
+    await installFakeScene(page, { twoPlayers: true });
+    await page.waitForTimeout(800);   // both hand slots light up → button enables
+    await page.click('#btn-start-match');
+    await page.waitForTimeout(300);
+    await page.evaluate(() => window.__airsmash.skipCountdown());
+    await page.waitForTimeout(250);
+    await page.evaluate(() => window.__airsmash.serveNow());
+    await page.waitForTimeout(250);
+    // Ball arcing toward the near rail between the two paddles.
+    await page.evaluate(() => {
+      window.__airsmash.placeBall(-0.15, 1.05, -0.2, -0.2, 1.0, 1.8, 'ai');
+      window.__airsmash.state.rally = 3;
+    });
+    await page.waitForTimeout(180);
+    await page.screenshot({ path: path.join(OUT, 'twoplayers.png') });
+    console.log('saved twoplayers.png');
 
   } finally {
     await browser.close();
