@@ -66,7 +66,7 @@ server.listen(PORT, async () => {
     // --- Intro ---
     check('intro visible', await page.isVisible('#screen-intro'));
     check('start button visible', await page.isVisible('#btn-start'));
-    check('mode segment has 2 options', (await page.locator('#mode-seg button').count()) === 2);
+    check('mode segment has 3 options', (await page.locator('#mode-seg button').count()) === 3);
     check('vs-ai mode preselected', await page.locator('#mode-seg button.on').getAttribute('data-mode') === 'ai');
     check('difficulty segment has 3 options', (await page.locator('#difficulty-seg button').count()) === 3);
     check('normal difficulty preselected', await page.locator('#difficulty-seg button.on').getAttribute('data-diff') === 'normal');
@@ -295,8 +295,9 @@ server.listen(PORT, async () => {
     check('2p: P2 hand slot still empty', (await api()).state.hand2.detected === false);
     check('2p: one hand is not enough', await page.locator('#btn-start-match').isDisabled());
 
-    // Both hands → unlocked.
-    await page.evaluate(() => window.__airsmash.setFakeHands([{ x: 0.32, y: 0.62 }, { x: 0.72, y: 0.68 }]));
+    // Both hands → unlocked. Hands sit inside their own half of the
+    // mirrored frame (P1 < 0.5, P2 > 0.5), like a real shared camera.
+    await page.evaluate(() => window.__airsmash.setFakeHands([{ x: 0.18, y: 0.62 }, { x: 0.82, y: 0.68 }]));
     await page.waitForTimeout(400);
     check('2p: both hand slots detected', (await api()).state.hand.detected === true && (await api()).state.hand2.detected === true);
     check('2p: start-match enabled with both hands', !(await page.locator('#btn-start-match').isDisabled()));
@@ -325,6 +326,16 @@ server.listen(PORT, async () => {
     const t2 = await page.evaluate(() => window.__airsmash.state.p2.targetX);
     check('2p: P1 hand drives near paddle', t1 < -0.2, `targetX=${t1.toFixed(2)}`);
     check('2p: P2 hand x flipped for far POV', t2 < -0.2, `targetX=${t2.toFixed(2)}`);
+
+    // Half-frame sensitivity: hands at the EDGE of each player's own
+    // camera half must reach the FAR end of their paddle span — nobody
+    // has to cross into the other player's half of the frame.
+    await page.evaluate(() => window.__airsmash.setFakeHands([{ x: 0.48, y: 0.62 }, { x: 0.88, y: 0.68 }]));
+    await page.waitForTimeout(500);
+    const nearRight = await page.evaluate(() => window.__airsmash.state.player.targetX);
+    const farLeft = await page.evaluate(() => window.__airsmash.state.p2.targetX);
+    check('2p: P1 covers full width from own camera half', nearRight > 0.8, `targetX=${nearRight.toFixed(2)}`);
+    check('2p: P2 covers full width from own camera half', farLeft < -0.8, `targetX=${farLeft.toFixed(2)}`);
 
     await page.evaluate(() => window.__airsmash.skipCountdown());
     await page.waitForTimeout(250);
@@ -394,6 +405,125 @@ server.listen(PORT, async () => {
     check('2p: difficulty block back in vs-ai mode', await page.isVisible('#difficulty-block'));
 
     check('no console errors', errors.length === 0, errors.join(' | ').slice(0, 200));
+
+    // --- LAN multiplayer: two devices (two pages), real WebSocket relay ---
+    const LAN_PORT = 3470;
+    const { spawn } = await import('child_process');
+    const lanProc = spawn(process.execPath, [path.join(DIR, 'lan-server.js'), String(LAN_PORT)],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let lanOut = '';
+    lanProc.stdout.on('data', d => { lanOut += d; });
+    lanProc.stderr.on('data', d => { lanOut += d; });
+
+    try {
+      // Wait for the server to announce itself.
+      await new Promise((resolve, reject) => {
+        const t0 = Date.now();
+        const iv = setInterval(() => {
+          if (lanOut.includes('LAN server running')) { clearInterval(iv); resolve(); }
+          else if (Date.now() - t0 > 6000) { clearInterval(iv); reject(new Error('lan-server did not start: ' + lanOut)); }
+        }, 50);
+      });
+
+      const mkLanPage = async () => {
+        const p = await (await browser.newContext({ viewport: { width: 1280, height: 860 } })).newPage();
+        p.lanErrors = [];
+        p.on('console', m => { if (m.type() === 'error') p.lanErrors.push(m.text()); });
+        p.on('pageerror', e => p.lanErrors.push(String(e)));
+        await p.goto(`http://localhost:${LAN_PORT}/?test=1`, { waitUntil: 'domcontentloaded' });
+        await p.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
+        await p.waitForTimeout(300);
+        return p;
+      };
+
+      const hostP = await mkLanPage();
+      await hostP.click('#mode-seg button[data-mode="lan"]');
+      await hostP.click('#btn-start');
+      await hostP.waitForTimeout(500);
+      check('lan: first device is host (P1)', await hostP.evaluate(() => window.__airsmash.state.lan.role === 'p1'));
+      check('lan: lobby note visible on setup', await hostP.isVisible('#lan-note'));
+
+      const guestP = await mkLanPage();
+      await guestP.click('#mode-seg button[data-mode="lan"]');
+      await guestP.click('#btn-start');
+      await guestP.waitForTimeout(600);
+      check('lan: second device is guest (P2)', await guestP.evaluate(() => window.__airsmash.state.lan.role === 'p2'));
+      check('lan: host sees peer connected', await hostP.evaluate(() => window.__airsmash.state.lan.connected === true));
+      check('lan: guest sees peer connected', await guestP.evaluate(() => window.__airsmash.state.lan.connected === true));
+
+      // Both raise a hand → readiness syncs over the wire.
+      await hostP.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.6));
+      await guestP.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.6));
+      await hostP.waitForTimeout(700);
+      check('lan: host sees guest ready', await hostP.evaluate(() => window.__airsmash.state.lan.peerReady === true));
+      check('lan: guest sees host ready', await guestP.evaluate(() => window.__airsmash.state.lan.peerReady === true));
+      check('lan: only the host can start',
+        !(await hostP.locator('#btn-start-match').isDisabled()) &&
+        (await guestP.locator('#btn-start-match').isDisabled()));
+
+      await hostP.click('#btn-start-match');
+      await hostP.waitForTimeout(500);
+      check('lan: match live on host', await hostP.evaluate(() =>
+        window.__airsmash.state.screen === 'play' && window.__airsmash.state.phase === 'countdown'));
+      check('lan: start relayed to guest', await guestP.evaluate(() =>
+        window.__airsmash.state.screen === 'play' && window.__airsmash.state.phase === 'countdown'));
+
+      await hostP.evaluate(() => window.__airsmash.skipCountdown());
+      await hostP.waitForTimeout(500);
+      check('lan: serve phase synced to guest', await guestP.evaluate(() => window.__airsmash.state.phase === 'serve'));
+      check('lan: ball state streams to guest', await guestP.evaluate(() => window.__airsmash.state.ball.visible));
+
+      // Guest hand drives the HOST's far paddle (full frame, flipped).
+      await guestP.evaluate(() => window.__airsmash.setFakeHand(0.85, 0.55));
+      await hostP.waitForTimeout(800);
+      const gx = await hostP.evaluate(() => window.__airsmash.state.p2.x);
+      check('lan: guest paddle reaches host sim (flipped)', gx < -0.3, `p2.x=${gx.toFixed(2)}`);
+
+      // Host paddle reaches the guest's view via state snapshots.
+      await hostP.evaluate(() => window.__airsmash.setFakeHand(0.15, 0.55));
+      await guestP.waitForTimeout(800);
+      const hx = await guestP.evaluate(() => window.__airsmash.state.player.x);
+      check('lan: host paddle renders on guest', hx < -0.3, `player.x=${hx.toFixed(2)}`);
+
+      // Scoring is host-authoritative; guest HUD + banner follow.
+      await hostP.evaluate(() => window.__airsmash.forceScore('ai'));
+      await hostP.waitForTimeout(600);
+      const gScore = await guestP.evaluate(() => ({
+        you: window.__airsmash.state.scoreYou, ai: window.__airsmash.state.scoreAI,
+      }));
+      check('lan: score syncs to guest', gScore.ai >= 1 && gScore.you === 0, JSON.stringify(gScore));
+      check('lan: point banner replays on guest', (await guestP.textContent('#banner-text')).includes('Player 2'),
+        await guestP.textContent('#banner-text'));
+
+      // Pause relays both ways.
+      await hostP.click('#btn-pause');
+      await hostP.waitForTimeout(400);
+      check('lan: pause syncs to guest', await guestP.evaluate(() => window.__airsmash.state.paused === true));
+      await guestP.click('#btn-resume');
+      await guestP.waitForTimeout(400);
+      check('lan: guest resume syncs back to host', await hostP.evaluate(() => window.__airsmash.state.paused === false));
+
+      // Game over overlays on both devices.
+      await hostP.evaluate(() => window.__airsmash.finishMatch('you'));
+      await hostP.waitForTimeout(700);
+      check('lan: game over on both devices',
+        await hostP.evaluate(() => window.__airsmash.state.phase === 'over') &&
+        await guestP.evaluate(() => window.__airsmash.state.phase === 'over'));
+      check('lan: guest game-over overlay filled in',
+        (await guestP.textContent('#gameover-title')).includes('wins!') &&
+        (await guestP.isVisible('#overlay-gameover')));
+
+      // Abrupt disconnect returns the survivor to the menu.
+      await guestP.context().close();
+      await hostP.waitForTimeout(700);
+      check('lan: host bounces to intro after disconnect', await hostP.evaluate(() =>
+        window.__airsmash.state.screen === 'intro'));
+      check('lan: no console errors (host page)', hostP.lanErrors.length === 0, hostP.lanErrors.join(' | ').slice(0, 150));
+
+      await hostP.context().close();
+    } finally {
+      lanProc.kill();
+    }
 
     // --- Mobile layout ---
     const mobile = await (await browser.newContext({

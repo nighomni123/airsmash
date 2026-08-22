@@ -2,8 +2,11 @@
    AirSmash — app.js  (3D first-person table tennis)
    Your hand is the paddle. Camera behind your end of the table,
    full view of the net, the opponent and the arena.
-   Two-player mode: two hands, two paddles on the near rail
-   (P1 left half, P2 right half) sharing one camera.
+   Two-player modes:
+     · 2 Players — one camera, split screen: P1 near end (left view),
+       P2 far end (right view); each hand owns half of the camera.
+     · LAN 2P    — two devices on one network (lan-server.js): each
+       tracks its own hand, host simulates, guest renders.
 
    Sections (banner-commented, top to bottom):
      1. Constants        — table dimensions, physics, difficulty
@@ -27,7 +30,8 @@
     18. Confetti
     19. Wiring           — buttons + keyboard
     20. Main loop
-    21. Test seam        — window.__airsmash (used by verify/capture)
+    21. LAN multiplayer  — two devices over WebSocket (lan-server.js)
+    22. Test seam        — window.__airsmash (used by verify/capture)
    ============================================================ */
 
 'use strict';
@@ -115,6 +119,10 @@ const PALM_IDX = [0, 5, 9, 13, 17];            // stable palm centroid
 const KEY_SPEED = 1.7;                         // keyboard fallback m/s
 const PREVIEW_INTERVAL_MS = 33;                // PiP redraw cap (~30fps saves main-thread time)
 
+// LAN multiplayer (two devices, host-authoritative).
+const LAN_STATE_MS = 50;                       // host → guest state broadcast interval
+const LAN_PAD_MS = 33;                         // guest → host paddle update interval
+
 const TEST_MODE = new URLSearchParams(location.search).has('test');
 const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -128,7 +136,21 @@ const state = {
   paused: false,
   difficulty: 'normal',
   inputMode: 'hand',         // hand | keyboard
-  mode: 'ai',                // ai = vs AI (P1 only) | 2p = two human players
+  mode: 'ai',                // ai = vs AI | 2p = two humans, one camera | lan = two devices
+
+  // LAN multiplayer (mode 'lan'). role: 'p1' hosts + simulates, 'p2'
+  // renders the far POV and streams its paddle to the host.
+  lan: {
+    ws: null,
+    role: null,              // 'p1' | 'p2' | null (unassigned)
+    connected: false,        // peer present in the room
+    peerReady: false,
+    remoteMsg: null,         // newest host→guest state snapshot
+    remotePad: null,         // newest guest→host paddle sample
+    lastPadSent: 0,
+    lastStateSent: 0,
+    lastReadySent: null,
+  },
 
   // Match
   scoreYou: 0,
@@ -208,7 +230,7 @@ function cacheDom() {
     'banner', 'banner-text', 'banner-sub', 'hand-hint',
     'screen-intro', 'screen-setup', 'screen-error',
     'overlay-pause', 'overlay-gameover', 'toast',
-    'mode-seg', 'mode-hint', 'difficulty-block',
+    'mode-seg', 'mode-hint', 'difficulty-block', 'lan-note',
     'difficulty-seg', 'btn-start', 'stat-wins', 'stat-losses', 'stat-rally',
     'setup-status', 'setup-progress', 'setup-progress-bar',
     'btn-start-match', 'btn-keyboard-mode',
@@ -266,7 +288,7 @@ function loadGame() {
     const data = JSON.parse(raw);
     if (typeof data.sound === 'boolean') state.sound = data.sound;
     if (data.difficulty && DIFFICULTY[data.difficulty]) state.difficulty = data.difficulty;
-    if (data.mode === 'ai' || data.mode === '2p') state.mode = data.mode;
+    if (data.mode === 'ai' || data.mode === '2p' || data.mode === 'lan') state.mode = data.mode;
     if (data.stats && typeof data.stats === 'object') {
       state.stats.wins = data.stats.wins | 0;
       state.stats.losses = data.stats.losses | 0;
@@ -291,7 +313,7 @@ function showScreen(name) {
   const showPreview = state.inputMode === 'hand' && (name === 'setup' || name === 'play');
   el.preview.classList.toggle('hidden', !showPreview);
   el.preview.classList.toggle('in-play', name === 'play');
-  el.preview.classList.toggle('split', twoPlayer());
+  el.preview.classList.toggle('split', state.mode === '2p');   // LAN shows one POV per device
 
   if (name !== 'play') {
     el['hand-hint'].classList.add('hidden');
@@ -302,14 +324,9 @@ function showScreen(name) {
 // Display names for the two sides, per mode. Internal keys stay
 // 'you'/'ai' everywhere (scoring, ball.lastHitter); only text differs.
 function sideLabel(side) {
-  if (state.mode === '2p') return side === 'you' ? 'Player 1' : 'Player 2';
-  return side === 'you' ? 'You' : 'AI';
+  if (state.mode === 'ai') return side === 'you' ? 'You' : 'AI';
+  return side === 'you' ? 'Player 1' : 'Player 2';
 }
-
-const MODE_HINTS = {
-  ai: 'One hand is your paddle — move it to swing.',
-  2: 'Two hands, two paddles: P1 left half · P2 right half.',
-};
 
 function syncModeUi() {
   for (const btn of el['mode-seg'].querySelectorAll('button')) {
@@ -317,16 +334,20 @@ function syncModeUi() {
     btn.classList.toggle('on', on);
     btn.setAttribute('aria-checked', String(on));
   }
-  el['difficulty-block'].classList.toggle('hidden', state.mode === '2p');
+  el['difficulty-block'].classList.toggle('hidden', state.mode !== 'ai');
   if (el['mode-hint']) {
-    el['mode-hint'].textContent = state.mode === '2p'
-      ? 'Split screen — P1 plays from the near end (left view), P2 from the far end (right view).'
-      : 'One hand is your paddle.';
+    el['mode-hint'].textContent =
+      state.mode === '2p'
+        ? 'Split screen — P1 plays from the near end (left view), P2 from the far end (right view). Each hand uses half of the camera.'
+        : state.mode === 'lan'
+          ? 'Two devices on the same Wi-Fi — run `node lan-server.js` and open the address it prints on both.'
+          : 'One hand is your paddle.';
   }
 }
 
 function setMode(mode) {
-  if (mode !== 'ai' && mode !== '2p') return;
+  if (mode !== 'ai' && mode !== '2p' && mode !== 'lan') return;
+  if (state.mode === 'lan' && mode !== 'lan') lanTeardown();
   state.mode = mode;
   syncModeUi();
   saveGame();
@@ -338,7 +359,10 @@ function refreshIntroStats() {
   el['stat-rally'].textContent = state.stats.bestRally;
 }
 
-function goToIntro() {
+function goToIntro(notifyPeer = true) {
+  if (notifyPeer && isLan() && state.lan.connected && state.screen === 'play') {
+    lanSend({ t: 'quit' });   // let the other device bow out too
+  }
   state.paused = false;
   state.phase = 'idle';
   refreshIntroStats();
@@ -354,12 +378,19 @@ function goToSetup() {
   el['btn-start-match'].disabled = true;
   el['btn-start-match'].textContent = twoPlayer() ? 'Waiting for both hands…' : 'Waiting for hand…';
   el['setup-progress'].classList.remove('hidden');
+  el['lan-note'].classList.toggle('hidden', !isLan());
   setSetupStatus('Starting camera…');
   showScreen('setup');
+  if (isLan()) lanBeginSetup();
   initCameraAndModel();
 }
 
 function twoPlayer() { return state.mode === '2p'; }
+function isLan() { return state.mode === 'lan'; }
+// Modes where the far side is a human, not the bot.
+function hasBot() { return state.mode === 'ai'; }
+// LAN: which paddle does THIS device control? P2 = far rail.
+function myPaddle() { return state.lan.role === 'p2' ? state.p2 : state.player; }
 
 function setSetupStatus(msg) { el['setup-status'].textContent = msg; }
 
@@ -369,6 +400,7 @@ function setSetupProgress(frac) {
 
 function setupReadyCheck() {
   if (state.screen !== 'setup') return;
+  if (isLan()) { lanSetupReadyCheck(); return; }
   if (state.cameraReady && state.modelReady) {
     setSetupProgress(1);
     el['setup-progress'].classList.add('hidden');
@@ -408,7 +440,7 @@ async function initCameraAndModel() {
     await camPromise;
     state.cameraReady = true;
     setSetupStatus(state.modelReady
-      ? (twoPlayer() ? 'Camera ready — show both hands ✋✋' : 'Camera ready — show your hand ✋')
+      ? (state.mode === '2p' ? 'Camera ready — show both hands ✋✋' : 'Camera ready — show your hand ✋')
       : 'Loading hand-tracking model…');
     setupReadyCheck();
   } catch (err) {
@@ -728,13 +760,29 @@ function assignPalm(slot, palm, nowMs) {
    ============================================================ */
 
 function updateHandInput(dt) {
-  updateHandSlot(state.hand, 0, dt);
-  if (twoPlayer()) updateHandSlot(state.hand2, 1, dt);
+  if (isLan()) { lanHandInput(dt); return; }
+  updateHandSlot(state.hand, state.player, handMapOpts(0), dt);
+  if (twoPlayer()) updateHandSlot(state.hand2, state.p2, handMapOpts(1), dt);
 }
 
-function updateHandSlot(hand, idx, dt) {
-  const pl = idx === 0 ? state.player : state.p2;
+// How a hand maps to a paddle, per mode:
+//   · 2 Players (one shared camera): each player owns HALF of the
+//     mirrored frame — their half stretches across the whole table so
+//     nobody has to reach into the other player's camera space. P2's
+//     axis also flips for their 180° view.
+//   · VS-AI / LAN (one player per camera): full frame; the LAN guest
+//     still flips because they watch the rotated POV.
+function handMapOpts(idx) {
+  if (state.mode === '2p') return { half: true, flip: idx === 1, pad: idx === 0 ? pad1Keys : pad2Keys };
+  return { half: false, flip: false, pad: pad1Keys };
+}
 
+function lanHandInput(dt) {
+  const flip = state.lan.role === 'p2';   // guest watches the rotated POV
+  updateHandSlot(state.hand, myPaddle(), { half: false, flip, pad: pad1Keys }, dt);
+}
+
+function updateHandSlot(hand, pl, opts, dt) {
   if (hand.detected) {
     hand.lostMs = 0;
 
@@ -753,13 +801,18 @@ function updateHandSlot(hand, idx, dt) {
     hand.smX += (hand.rawX - hand.smX) * a;
     hand.smY += (hand.rawY - hand.smY) * a;
 
-    // Map normalized hand position into the paddle workspace. P2 plays
-    // from the far rail watching a 180°-rotated view, so their x axis is
-    // flipped: moving your hand to *your* right moves your paddle to
-    // your right on screen.
-    const nx = (hand.smX - HAND_X_MIN) / (HAND_X_MAX - HAND_X_MIN);
+    // Map normalized hand position into the paddle workspace.
+    let nx;
+    if (opts.half) {
+      // Stretch this player's half of the frame over the full table.
+      const lo = opts.flip ? 0.5 : HAND_X_MIN;
+      const hi = opts.flip ? HAND_X_MAX : 0.5;
+      nx = (hand.smX - lo) / (hi - lo);
+    } else {
+      nx = (hand.smX - HAND_X_MIN) / (HAND_X_MAX - HAND_X_MIN);
+    }
     const ny = (hand.smY - HAND_Y_MIN) / (HAND_Y_MAX - HAND_Y_MIN);
-    const flip = idx === 1 ? -1 : 1;
+    const flip = opts.flip ? -1 : 1;
     pl.targetX = flip * Math.min(1.12, Math.max(-1.12, nx * 2 - 1)) * PADDLE_X_RANGE;
     pl.targetY = PADDLE_Y_TOP - Math.min(1, Math.max(0, ny)) * (PADDLE_Y_TOP - PADDLE_Y_BOT);
   } else {
@@ -767,10 +820,11 @@ function updateHandSlot(hand, idx, dt) {
     // Paddle coasts: targets stay where they were.
   }
 
-  movePaddle(pl, idx === 0 ? pad1Keys : pad2Keys, dt);
+  movePaddle(pl, opts.pad, dt);
 }
 
 function updateKeyboardInput(dt) {
+  if (isLan()) { drivePaddleKeyboard(myPaddle(), pad1Keys, dt); return; }
   drivePaddleKeyboard(state.player, pad1Keys, dt);
   if (twoPlayer()) drivePaddleKeyboard(state.p2, pad2Keys, dt);
 }
@@ -778,8 +832,9 @@ function updateKeyboardInput(dt) {
 function drivePaddleKeyboard(p, keysPad, dt) {
   const dx = (keysPad.right ? 1 : 0) - (keysPad.left ? 1 : 0);
   const dy = (keysPad.down ? 1 : 0) - (keysPad.up ? 1 : 0);
-  // P2's view is rotated 180°, so their left/right keys flip in world x.
-  const flip = twoPlayer() && p === state.p2 ? -1 : 1;
+  // The far-rail paddle (P2 / LAN guest) watches a 180°-rotated view,
+  // so their left/right keys flip in world x.
+  const flip = !hasBot() && p === state.p2 ? -1 : 1;
   p.targetX = p.x + flip * dx * KEY_SPEED * dt;
   p.targetY = p.y - dy * KEY_SPEED * dt;
   movePaddle(p, keysPad, dt);
@@ -1174,7 +1229,7 @@ function resetMatch() {
 
 // The AI figure only exists in single-player mode.
 function syncOpponentVisibility() {
-  if (world.opponent) world.opponent.visible = !twoPlayer();
+  if (world.opponent) world.opponent.visible = hasBot();
 }
 
 function startMatch() {
@@ -1185,12 +1240,14 @@ function startMatch() {
   state.phase = 'countdown';
   state.timer = COUNTDOWN_STEP * 3;
   state.lastCountdown = -1;
+  // LAN: whichever device starts (or restarts) drags its peer along.
+  if (isLan() && !lanApplyingRemote && state.lan.role) lanSend({ t: 'start' });
 }
 
 function syncScoreLabels() {
   if (!el['score-label-you']) return;
-  el['score-label-you'].textContent = twoPlayer() ? 'P1' : 'YOU';
-  el['score-label-ai'].textContent = twoPlayer() ? 'P2' : 'AI';
+  el['score-label-you'].textContent = hasBot() ? 'YOU' : 'P1';
+  el['score-label-ai'].textContent = hasBot() ? 'AI' : 'P2';
 }
 
 function currentServer() {
@@ -1205,10 +1262,10 @@ function currentServer() {
 // Banner text for whoever is about to serve.
 function showServeBanner() {
   if (state.serveSide === 'you') {
-    showBanner(twoPlayer() ? "Player 1's serve" : 'Your serve', 'Swipe through the ball to launch it');
+    showBanner(hasBot() ? 'Your serve' : "Player 1's serve", 'Swipe through the ball to launch it');
   } else {
-    showBanner(twoPlayer() ? "Player 2's serve" : 'AI serve',
-      twoPlayer() ? 'Swipe through the ball to launch it' : 'Get ready…');
+    showBanner(hasBot() ? 'AI serve' : "Player 2's serve",
+      hasBot() ? 'Get ready…' : 'Swipe through the ball to launch it');
   }
 }
 
@@ -1230,14 +1287,14 @@ function beginServe() {
 // The paddle that is currently serving.
 function serverPaddle() {
   if (state.serveSide === 'you') return state.player;
-  return twoPlayer() ? state.p2 : state.ai;
+  return hasBot() ? state.ai : state.p2;
 }
 
 // Unified serve launch for all three cases (P1 / P2 / AI).
 function launchServe() {
   const b = state.ball;
   const sp = serverPaddle();
-  const aiControlled = state.serveSide === 'ai' && !twoPlayer();
+  const aiControlled = state.serveSide === 'ai' && hasBot();
   const cfg = DIFFICULTY[state.difficulty];
 
   const power = aiControlled
@@ -1270,11 +1327,11 @@ function scorePoint(winner) {
   state.timer = POINT_TIME;
 
   if (winner === 'you') {
-    showBanner(twoPlayer() ? 'Point Player 1!' : 'Your point!', `${state.scoreYou} : ${state.scoreAI}`, 'you');
+    showBanner(hasBot() ? 'Your point!' : 'Point Player 1!', `${state.scoreYou} : ${state.scoreAI}`, 'you');
     blip(660, 0.09, 'sine', 0.07);
     setTimeout(() => blip(880, 0.12, 'sine', 0.07), 90);
   } else {
-    showBanner(twoPlayer() ? 'Point Player 2!' : 'AI point', `${state.scoreYou} : ${state.scoreAI}`, 'ai');
+    showBanner(hasBot() ? 'AI point' : 'Point Player 2!', `${state.scoreYou} : ${state.scoreAI}`, 'ai');
     blip(330, 0.1, 'sine', 0.06);
     setTimeout(() => blip(247, 0.14, 'sine', 0.06), 100);
   }
@@ -1297,26 +1354,40 @@ function endMatch(winner) {
     state.stats.bestRally = state.longestRally;
     saveGame();
   }
-  // Wins/losses are a "you vs AI" record — two-player matches don't touch them.
-  if (!twoPlayer()) {
+  // Wins/losses are a "you vs AI" record — human-vs-human matches don't touch them.
+  if (hasBot()) {
     if (winner === 'you') state.stats.wins++; else state.stats.losses++;
     saveGame();
   }
 
   const you = state.scoreYou, ai = state.scoreAI;
-  el['gameover-emoji'].textContent = (winner === 'you' || twoPlayer()) ? '🏆' : '🤖';
-  el['gameover-title'].textContent = twoPlayer()
+  const humanVHuman = !hasBot();
+  el['gameover-emoji'].textContent = (winner === 'you' || humanVHuman) ? '🏆' : '🤖';
+  el['gameover-title'].textContent = humanVHuman
     ? `${sideLabel(winner)} wins!`
     : (winner === 'you' ? 'You win!' : 'AI wins');
   el['gameover-title'].className = winner === 'you' ? 'win' : 'lose';
   el['gameover-score'].textContent = `${you} : ${ai}`;
   el['gameover-rally'].textContent = state.longestRally;
-  el['gameover-diff'].textContent = twoPlayer() ? '2 Players' : DIFFICULTY[state.difficulty].label;
+  el['gameover-diff'].textContent = state.mode === '2p' ? '2 Players'
+    : state.mode === 'lan' ? 'LAN 2P'
+      : DIFFICULTY[state.difficulty].label;
   hideBanner();
   showScreen('play');   // reveals the game-over overlay
+  // LAN: the guest rebuilds this overlay from the event (sounds arrive
+  // separately via the blip relay).
+  lanEmit({
+    k: 'over',
+    emoji: el['gameover-emoji'].textContent,
+    title: el['gameover-title'].textContent,
+    cls: el['gameover-title'].className,
+    score: el['gameover-score'].textContent,
+    rally: state.longestRally,
+    diffLabel: el['gameover-diff'].textContent,
+  });
 
-  // Both players are human in 2p — always celebrate.
-  const celebrate = winner === 'you' || twoPlayer();
+  // Both sides are human in 2p/LAN — always celebrate.
+  const celebrate = winner === 'you' || humanVHuman;
   if (celebrate) {
     spawnConfetti();
     [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => blip(f, 0.16, 'triangle', 0.07), i * 130));
@@ -1327,8 +1398,8 @@ function endMatch(winner) {
 
 function updateServeChip() {
   el['serve-chip'].textContent = state.serveSide === 'you'
-    ? (twoPlayer() ? 'P1 serve' : 'Your serve')
-    : (twoPlayer() ? 'P2 serve' : 'AI serve');
+    ? (hasBot() ? 'Your serve' : 'P1 serve')
+    : (hasBot() ? 'AI serve' : 'P2 serve');
 }
 
 function clampNum(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
@@ -1455,10 +1526,10 @@ function stepBall(dt, scoring) {
    13. PLAYER HITTING
    ============================================================ */
 
-// The human-controlled paddles: P1 always; P2 joins in two-player,
-// playing from the FAR rail (opposite ends, like real table tennis).
+// The human-controlled paddles: P1 always; P2 (far rail) joins when the
+// far side is a human — two-player on one device, or the LAN guest.
 function nearSidePaddles() {
-  return twoPlayer() ? [state.player, state.p2] : [state.player];
+  return hasBot() ? [state.player] : [state.player, state.p2];
 }
 
 function stepPlayerHit(dt) {
@@ -1498,7 +1569,7 @@ function playerReturn(pl) {
   b.validOpponentBounce = false;
   state.rally++;
   pl.hitCooldown = 0.3;
-  if (!twoPlayer()) {
+  if (hasBot()) {
     // Only the bot needs a reaction delay + fresh aim error.
     state.ai.reactT = DIFFICULTY[state.difficulty].react;
     state.ai.aimErrX = 0; state.ai.aimErrZ = 0;
@@ -1516,7 +1587,7 @@ function hitSound(speed) {
    ============================================================ */
 
 function stepAI(dt) {
-  if (twoPlayer()) return;               // no bot on the far side in 2-player
+  if (!hasBot()) return;                 // no bot when the far side is human
   const cfg = DIFFICULTY[state.difficulty];
   const ai = state.ai;
   const b = state.ball;
@@ -1615,8 +1686,8 @@ function renderScene(dt) {
   pp.rotation.x = 0.12 + clampNum(p.vy * 0.04, -0.35, 0.35);
 
   if (world.p2Paddle) {
-    world.p2Paddle.visible = twoPlayer();
-    if (twoPlayer()) {
+    world.p2Paddle.visible = !hasBot();   // P2's paddle in 2p and LAN
+    if (!hasBot()) {
       const q = state.p2;
       world.p2Paddle.position.set(q.x, q.y, q.z);
       world.p2Paddle.rotation.z = clampNum(-q.vx * 0.05, -0.5, 0.5);
@@ -1626,8 +1697,8 @@ function renderScene(dt) {
 
   // AI paddle (single-player only).
   const ap = world.aiPaddle;
-  ap.visible = !twoPlayer();
-  if (!twoPlayer()) {
+  ap.visible = hasBot();
+  if (hasBot()) {
     ap.position.set(state.ai.x, state.ai.y, state.ai.z);
     ap.rotation.z = clampNum(state.ai.vx * 0.04, -0.4, 0.4);
   }
@@ -1666,10 +1737,21 @@ function renderScene(dt) {
   }
 
   // Camera sway follows each player's own paddle, then draw.
-  // Two-player: split screen — left half is P1's POV from the near end,
-  // right half is P2's POV from the far end (180° around the table).
+  // Two-player (one device): split screen — left half is P1's POV from
+  // the near end, right half is P2's POV from the far end (180° around).
+  // LAN: each device renders ONE full-screen POV — its own.
   const r = world.renderer;
-  if (twoPlayer() && world.camera2) {
+  const fullAspect = view.w / view.h;
+  if (isLan() && world.camera2) {
+    const guest = state.lan.role === 'p2';
+    const cam = guest ? world.camera2 : world.camera;
+    const mine = myPaddle();
+    cam.position.x += (mine.x * 0.09 - cam.position.x) * Math.min(1, dt * 5);
+    cam.lookAt(0, 0.78, guest ? 0.55 : -0.55);
+    if (cam.aspect !== fullAspect) { cam.aspect = fullAspect; cam.updateProjectionMatrix(); }
+    r.setViewport(0, 0, view.w, view.h);
+    r.render(world.scene, cam);
+  } else if (twoPlayer() && world.camera2) {
     world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
     world.camera.lookAt(0, 0.78, -0.55);
     world.camera2.position.x += (state.p2.x * 0.09 - world.camera2.position.x) * Math.min(1, dt * 5);
@@ -1689,8 +1771,7 @@ function renderScene(dt) {
     r.render(world.scene, world.camera2);
     r.setScissorTest(false);
   } else {
-    const aspect = view.w / view.h;
-    if (world.camera.aspect !== aspect) { world.camera.aspect = aspect; world.camera.updateProjectionMatrix(); }
+    if (world.camera.aspect !== fullAspect) { world.camera.aspect = fullAspect; world.camera.updateProjectionMatrix(); }
     world.camera.position.x += (p.x * 0.09 - world.camera.position.x) * Math.min(1, dt * 5);
     world.camera.lookAt(0, 0.78, -0.55);
     r.setViewport(0, 0, view.w, view.h);
@@ -1715,9 +1796,10 @@ function drawPreview() {
   const feed = TEST_MODE ? state.fakeBackground : null;
   const liveVideo = !TEST_MODE && video && video.readyState >= 2 && video.videoWidth ? video : null;
 
-  // Two-player: the preview splits down the middle — left half is P1's
-  // region of the (mirrored) feed, right half is P2's.
-  const split = twoPlayer();
+  // Two-player on one device: the preview splits down the middle — left
+  // half is P1's region of the (mirrored) feed, right half is P2's.
+  // LAN devices show their own single hand full-size.
+  const split = state.mode === '2p';
 
   if (feed || liveVideo) {
     const src = feed || liveVideo;
@@ -1819,11 +1901,13 @@ function showBanner(text, sub, tone) {
   el.banner.classList.remove('pop');
   void el.banner.offsetWidth;          // restart the pop animation
   el.banner.classList.add('pop');
+  lanEmit({ k: 'banner', text, sub: sub || '', tone: tone || '' });
 }
 
 function hideBanner() {
   el.banner.classList.add('hidden');
   if (bannerTimeout) { clearTimeout(bannerTimeout); bannerTimeout = null; }
+  lanEmit({ k: 'hide' });
 }
 
 let toastTimeout = null;
@@ -1852,19 +1936,24 @@ function ensureAudio() {
 
 function blip(freq, dur = 0.06, type = 'sine', gain = 0.05) {
   try {
-    const ac = ensureAudio();
-    if (!ac) return;
-    const o = ac.createOscillator();
-    const g = ac.createGain();
-    o.type = type;
-    o.frequency.value = freq;
-    g.gain.setValueAtTime(gain, ac.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
-    o.connect(g);
-    g.connect(ac.destination);
-    o.start();
-    o.stop(ac.currentTime + dur + 0.02);
+    lanEmit({ k: 'blip', f: freq, d: dur, ty: type, g: gain });   // LAN guest replays host sounds
+    playTone(freq, dur, type, gain);
   } catch { /* sound must never break gameplay */ }
+}
+
+function playTone(freq, dur, type, gain) {
+  const ac = ensureAudio();
+  if (!ac) return;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(gain, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g);
+  g.connect(ac.destination);
+  o.start();
+  o.stop(ac.currentTime + dur + 0.02);
 }
 
 function syncSoundBtn() {
@@ -1950,6 +2039,8 @@ function togglePause(force) {
   if (next === state.paused) return;
   state.paused = next;
   showScreen('play');
+  // LAN: keep both devices' pause state in sync (host stays authoritative).
+  if (isLan()) lanSend({ t: 'pause', v: next });
   if (state.paused) {
     hideBanner();
     blip(300, 0.06, 'sine', 0.04);
@@ -1959,8 +2050,18 @@ function togglePause(force) {
   }
 }
 
+// Set on the guest while applying a host-initiated action, so the
+// relayed broadcast doesn't echo back over the wire.
+let lanApplyingRemote = false;
+
 function startKeyboardMode() {
   state.inputMode = 'keyboard';
+  if (isLan()) {
+    toast('LAN keyboard — WASD or arrows move · Space swings');
+    if (state.lan.role === 'p2') { lanSetupReadyCheck(); return; }   // guest waits for the host
+    startMatch();
+    return;
+  }
   toast(twoPlayer()
     ? '2P keyboard — P1: WASD + Space · P2: Arrows + Enter'
     : 'Keyboard mode — arrows move, Space swings');
@@ -2053,10 +2154,15 @@ let lastTs = 0;
 
 function update(dt, nowMs) {
   pumpTracking(nowMs);
+  lanTick();   // LAN lobby bookkeeping (readiness sync) — a no-op otherwise
+
+  // LAN guest: a render-only device — it never simulates the match.
+  if (isLan() && state.lan.role === 'p2') { updateLanGuest(dt, nowMs); return; }
 
   // Paddles follow hands on the setup screen too (live preview).
   if (state.screen === 'setup') {
     if (state.inputMode === 'hand') updateHandInput(dt);
+    if (isLan()) lanHostStep(dt, nowMs);
     return;
   }
   if (state.screen !== 'play' || state.paused) return;
@@ -2064,20 +2170,21 @@ function update(dt, nowMs) {
   if (state.inputMode === 'hand') updateHandInput(dt);
   else updateKeyboardInput(dt);
   updateHandHints();
+  if (isLan()) lanHostStep(dt, nowMs);     // fold the peer's paddle into the sim + broadcast
 
   if (state.phase === 'countdown') {
     state.timer -= dt;
     const n = Math.max(1, Math.ceil(state.timer / COUNTDOWN_STEP));
     if (n !== state.lastCountdown) {
       state.lastCountdown = n;
-      showBanner(String(n), twoPlayer() ? 'P1 vs P2 — first to 11' : 'First to 11 — win by 2');
+      showBanner(String(n), hasBot() ? 'First to 11 — win by 2' : 'P1 vs P2 — first to 11');
       blip(440, 0.05, 'sine', 0.045);
     }
     if (state.timer <= 0) beginServe();
   } else if (state.phase === 'serve') {
     state.serveTimer += dt;
     const b = state.ball;
-    const aiServing = state.serveSide === 'ai' && !twoPlayer();
+    const aiServing = state.serveSide === 'ai' && hasBot();
     if (!aiServing) {
       // Human server (P1 or P2): the ball floats beside their paddle
       // until they swipe through it.
@@ -2120,7 +2227,308 @@ function frame(ts) {
 }
 
 /* ============================================================
-   21. TEST SEAM — used by verify.js / capture.js (?test=1)
+   21. LAN MULTIPLAYER — two devices on one network
+   ============================================================
+   One device runs `node lan-server.js` (static files + a tiny
+   WebSocket room relay, zero dependencies). Both players open the
+   printed address; the server casts the first connection as P1 (host)
+   and the second as P2 (guest).
+
+   Topology: HOST-AUTHORITATIVE. The host runs the full simulation and
+   broadcasts compact state snapshots (~20Hz). The guest renders its own
+   POV from those snapshots, streams its paddle pose back (~30Hz), and
+   never simulates. Banners + sounds are replayed on the guest via small
+   events so both sides see and hear the same match. */
+
+function lanConnect() {
+  if (state.lan.ws && (state.lan.ws.readyState === 0 || state.lan.ws.readyState === 1)) return;
+  let ws;
+  try {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+  } catch {
+    lanUnavailable();
+    return;
+  }
+  state.lan.ws = ws;
+  ws.onmessage = (e) => {
+    let m = null;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (m) lanHandleMessage(m);
+  };
+  ws.onerror = () => { if (!state.lan.role) lanUnavailable(); };
+  ws.onclose = () => {
+    const hadRole = !!state.lan.role;
+    lanResetConn();
+    if (hadRole && isLan() && state.screen === 'play') {
+      toast('LAN connection lost');
+      goToIntro(false);
+    } else if (!hadRole && isLan() && state.screen === 'setup') {
+      lanUnavailable();
+    }
+  };
+}
+
+// Host-only broadcast of presentation events (banners, sounds, game over).
+function lanEmit(evt) {
+  if (!isLan() || state.lan.role !== 'p1') return;
+  evt.t = 'evt';
+  lanSend(evt);
+}
+
+function lanSend(obj) {
+  try {
+    const ws = state.lan.ws;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  } catch { /* a dropped frame must never break gameplay */ }
+}
+
+function lanUnavailable() {
+  showError('LAN server unreachable',
+    'LAN play needs the bundled server. On one device run: node lan-server.js — then open the address it prints on BOTH devices.');
+}
+
+function lanResetConn() {
+  state.lan.ws = null;
+  state.lan.role = null;
+  state.lan.connected = false;
+  state.lan.peerReady = false;
+  state.lan.remoteMsg = null;
+  state.lan.remotePad = null;
+  state.lan.lastReadySent = null;
+}
+
+function lanTeardown() {
+  if (state.lan.ws) {
+    try { state.lan.ws.onclose = null; state.lan.ws.close(); } catch { /* ignore */ }
+  }
+  lanResetConn();
+  if (el['lan-note']) el['lan-note'].classList.add('hidden');
+}
+
+function lanBeginSetup() {
+  el['lan-note'].classList.remove('hidden');
+  state.lan.peerReady = false;
+  state.lan.lastReadySent = null;
+  lanUpdateNote('Connecting to the LAN room…');
+  lanConnect();
+}
+
+function lanUpdateNote(text) {
+  if (el['lan-note']) el['lan-note'].textContent = text;
+}
+
+function lanHandleMessage(m) {
+  switch (m.t) {
+    case 'welcome': {
+      const prev = state.lan.role;
+      state.lan.role = m.role;
+      if (prev && prev !== m.role) {         // room reshuffled — start clean
+        if (state.screen === 'play') { toast('Player slots changed'); goToIntro(false); }
+        state.lan.peerReady = false;
+      }
+      setupReadyCheck();
+      break;
+    }
+    case 'peers': {
+      const wasConnected = state.lan.connected;
+      state.lan.connected = m.n >= 2;
+      if (state.lan.connected && !wasConnected) state.lan.peerReady = false;
+      if (!state.lan.connected && wasConnected && state.screen === 'play') {
+        toast('Your opponent disconnected');
+        goToIntro(false);
+      } else {
+        setupReadyCheck();
+      }
+      break;
+    }
+    case 'full':
+      toast('That room already has two players');
+      lanTeardown();
+      break;
+    case 'ready':
+      state.lan.peerReady = !!m.v;
+      setupReadyCheck();
+      break;
+    case 'start':
+      lanApplyingRemote = true;
+      try { startMatch(); } finally { lanApplyingRemote = false; }
+      break;
+    case 'pad':
+      if (state.lan.role === 'p1') state.lan.remotePad = m;
+      break;
+    case 'st':
+      if (state.lan.role === 'p2') state.lan.remoteMsg = m;
+      break;
+    case 'evt':
+      if (state.lan.role !== 'p2') break;
+      if (m.k === 'banner') showBanner(m.text, m.sub, m.tone);
+      else if (m.k === 'hide') hideBanner();
+      else if (m.k === 'blip') playTone(m.f, m.d, m.ty, m.g);
+      else if (m.k === 'over') lanApplyGameOver(m);
+      break;
+    case 'pause':
+      // Apply without echoing back (togglePause would rebroadcast).
+      if (state.paused !== m.v) {
+        state.paused = m.v;
+        showScreen('play');
+        if (m.v) hideBanner();
+        else if (state.phase === 'serve') showServeBanner();
+      }
+      break;
+    case 'quit':
+      toast('Your opponent left the match');
+      goToIntro(false);
+      break;
+  }
+}
+
+// Per-frame lobby bookkeeping: keep readiness in sync with the peer.
+function lanTick() {
+  if (!isLan() || !state.lan.role || !state.lan.connected) return;
+  const ready = state.hand.everDetected || state.inputMode === 'keyboard';
+  if (state.lan.lastReadySent !== ready) {
+    state.lan.lastReadySent = ready;
+    lanSend({ t: 'ready', v: ready });
+  }
+}
+
+// Host: fold the guest's latest paddle sample into the sim + broadcast.
+function lanHostStep(dt, nowMs) {
+  const m = state.lan.remotePad;
+  if (m) {
+    const q = state.p2;
+    const k = Math.min(1, dt * 22);          // smooth the 30Hz samples
+    q.targetX = m.x; q.targetY = m.y;
+    q.x += (m.x - q.x) * k;
+    q.y += (m.y - q.y) * k;
+    q.vx = m.vx; q.vy = m.vy; q.speed = m.sp;
+    const rail = q.railZ !== undefined ? q.railZ : PADDLE_Z_FAR;
+    const lunge = Math.min(0.18, q.speed * 0.045);
+    q.z = rail + (rail > 0 ? -lunge : lunge);
+  }
+  if (state.screen !== 'play') return;
+  if (nowMs - state.lan.lastStateSent >= LAN_STATE_MS) {
+    state.lan.lastStateSent = nowMs;
+    const b = state.ball;
+    lanSend({
+      t: 'st',
+      ph: state.phase,
+      sy: state.scoreYou, sa: state.scoreAI,
+      sv: state.serveSide, r: state.rally, pz: state.paused,
+      b: { x: b.x, y: b.y, z: b.z, vx: b.vx, vy: b.vy, vz: b.vz, lh: b.lastHitter, v: b.visible },
+      o: { x: state.player.x, y: state.player.y, z: state.player.z },
+    });
+  }
+}
+
+// Guest per-frame: local input + paddle streaming + apply host state.
+function updateLanGuest(dt, nowMs) {
+  if (state.screen === 'setup') {
+    if (state.inputMode === 'hand') updateHandInput(dt);
+    return;
+  }
+  if (state.screen !== 'play') return;
+
+  if (state.inputMode === 'hand') updateHandInput(dt);
+  else updateKeyboardInput(dt);
+  updateHandHints();
+
+  if (nowMs - state.lan.lastPadSent >= LAN_PAD_MS) {
+    state.lan.lastPadSent = nowMs;
+    const q = myPaddle();
+    lanSend({ t: 'pad', x: q.x, y: q.y, vx: q.vx, vy: q.vy, sp: q.speed });
+  }
+
+  if (state.paused) return;
+  lanApplyLatestState(dt);
+}
+
+// Guest: ease ball + opponent paddle toward the host's latest snapshot.
+function lanApplyLatestState(dt) {
+  const m = state.lan.remoteMsg;
+  if (!m) return;
+
+  state.scoreYou = m.sy;
+  state.scoreAI = m.sa;
+  state.serveSide = m.sv;
+  state.rally = m.r;
+  if (m.r > state.longestRally) state.longestRally = m.r;
+  if (m.pz !== state.paused) {
+    state.paused = m.pz;
+    showScreen('play');
+  }
+  if (state.phase !== m.ph) {
+    state.phase = m.ph;
+    if (m.ph === 'serve') updateServeChip();
+    if (m.ph !== 'rally') trailPts.length = 0;
+  }
+
+  const b = state.ball, tb = m.b;
+  b.visible = tb.v;
+  b.lastHitter = tb.lh;
+  b.vx = tb.vx; b.vy = tb.vy; b.vz = tb.vz;
+  if (!b.visible || state.phase === 'serve' || state.phase === 'countdown') {
+    b.x = tb.x; b.y = tb.y; b.z = tb.z;       // pinned balls snap (no laggy float)
+  } else {
+    const k = Math.min(1, dt * 16);
+    b.x += (tb.x - b.x) * k;
+    b.y += (tb.y - b.y) * k;
+    b.z += (tb.z - b.z) * k;
+  }
+
+  const o = state.player, to = m.o, k2 = Math.min(1, dt * 14);
+  o.x += (to.x - o.x) * k2;
+  o.y += (to.y - o.y) * k2;
+  o.z = to.z;
+}
+
+// Guest: rebuild the game-over overlay from the host's event.
+function lanApplyGameOver(m) {
+  el['gameover-emoji'].textContent = m.emoji;
+  el['gameover-title'].textContent = m.title;
+  el['gameover-title'].className = m.cls;
+  el['gameover-score'].textContent = m.score;
+  el['gameover-rally'].textContent = m.rally;
+  el['gameover-diff'].textContent = m.diffLabel;
+  state.phase = 'over';
+  hideBanner();
+  spawnConfetti();
+  showScreen('play');
+}
+
+// LAN variant of the setup gate: one hand here + the peer ready over there.
+function lanSetupReadyCheck() {
+  const camOk = state.cameraReady && state.modelReady;
+  if (camOk) {
+    setSetupProgress(1);
+    el['setup-progress'].classList.add('hidden');
+    setSetupStatus('Camera ready — show your hand ✋');
+  }
+  const localReady = state.hand.everDetected || state.inputMode === 'keyboard';
+  const both = camOk && localReady && state.lan.connected && state.lan.peerReady;
+  const amHost = state.lan.role === 'p1';
+  const btn = el['btn-start-match'];
+  btn.disabled = amHost ? !both : true;
+  btn.textContent = amHost
+    ? (both ? 'Start match' : 'Waiting for player 2…')
+    : 'Waiting for host…';
+
+  let note;
+  const wsOpen = state.lan.ws && state.lan.ws.readyState <= 1;
+  if (!wsOpen) note = 'Not connected — is `node lan-server.js` running?';
+  else if (!state.lan.role) note = 'Connecting to the LAN room…';
+  else if (!state.lan.connected) note = amHost
+    ? `You are Player 1 (host). Player 2: open this same address (${location.host}) on their device.`
+    : 'You are Player 2 — waiting for Player 1 (host)…';
+  else if (!both) note = amHost
+    ? 'Player 2 connected! Both players: show a hand ✋'
+    : 'Connected to Player 1 — show your hand ✋ and wait for the host to start.';
+  else note = amHost ? 'Both ready — start when you like.' : 'Ready! Waiting for the host to start…';
+  lanUpdateNote(note);
+}
+
+/* ============================================================
+   22. TEST SEAM — used by verify.js / capture.js (?test=1)
    ============================================================ */
 
 window.__airsmash = {
@@ -2174,6 +2582,8 @@ window.__airsmash = {
       if (state.phase === 'point') state.phase = 'rally';
     }
   },
+  // Send a raw LAN protocol message (used by tests to simulate a peer).
+  lanSend,
 };
 
 /* ============================================================

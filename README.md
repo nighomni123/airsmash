@@ -35,8 +35,8 @@ Motion games died with the console generation that hosted them — but every lap
 ## How to Play
 
 1. **Start playing**, pick a mode, and allow camera access.
-2. **Raise your hand** (both hands in 2-player mode), palm toward the camera. When you see it in the preview, hit **Start match**.
-3. **Move your hand** left/right and up/down — the paddle mirrors you in 3D. In 2-player you face each other across the net: P1's POV fills the left half of the screen, P2's the right, and each hand drives its own paddle.
+2. **Raise your hand** (both hands in 2-player mode; one per device in LAN mode), palm toward the camera. When you see it in the preview, hit **Start match**.
+3. **Move your hand** left/right and up/down — the paddle mirrors you in 3D. In 2-player you face each other across the net: P1's POV fills the left half of the screen, P2's the right, and each hand drives its own paddle from its own half of the camera.
 4. **Swing through the ball** to return it. Your swing speed adds power; your swing direction steers the shot. After a serve or return, the *other* player must hit it back.
 5. **Your serve**: the ball floats beside your paddle — swipe through it to launch.
 6. **First to 11 wins** (win by 2; sudden death at 15). Serve alternates every 2 points.
@@ -46,10 +46,21 @@ Real-ish rules: the ball must clear the net and land on the opponent's side. Mis
 ## Two-Player Mode
 
 - **Opposite ends, split screen.** P1 plays from the near end (left half of the screen), P2 from the far end (right half, rotated 180°) — you face each other across the net like real table tennis, sharing one camera and one keyboard.
-- **One camera tracks both hands.** The tracker runs with `numHands: 2`; each detected hand is locked to whichever player it was nearest recently (fresh sessions: leftmost hand in the mirror view → P1). P2's x axis is flipped so moving your hand to *your* right moves *your* paddle to your right in your own view.
-- **Split camera preview.** The PiP divides down the middle: P1's half of the feed (cyan skeleton, left) and P2's (orange, right), each labeled — and it straddles the seam between the two views during play.
-- **Same rules as vs-AI**: serves alternate every 2 points, faults are faults, deuce just works — the scoring engine treats P2 exactly like a far-side receiver. Wins/losses stats stay a "you vs AI" record; only best rally carries over from 2P matches.
+- **Half-frame controls.** Each player owns half of the camera: P1's half of the frame stretches across the whole table for them, and the same for P2 — so nobody has to reach across into the other player's space to cover their side. P2's axis is flipped once more so moving your hand to *your* right moves *your* paddle to your right in your own view.
+- **Split camera preview.** The PiP divides down the middle: P1's half of the feed (cyan skeleton, left) and P2's (orange, right), each labeled — matching each player's control region.
+- **Same rules as vs-AI**: serves alternate every 2 points, faults are faults, deuce just works — the scoring engine treats P2 exactly like a far-side receiver. Wins/losses stats stay a "you vs AI" record; only best rally carries over from human-vs-human matches.
 - **Keyboard fallback**: P1 = <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> + <kbd>Space</kbd>, P2 = arrow keys + <kbd>Enter</kbd> (arrow directions are relative to P2's own view).
+
+## LAN Multiplayer (two devices)
+
+Play from opposite sides of the real room — one device per player, same Wi-Fi:
+
+```bash
+node lan-server.js          # serves the game + relays match data (port 8000)
+node lan-server.js 8080     # custom port
+```
+
+Open the printed `http://<ip>:<port>` address on both devices. The first device to connect is **Player 1 (host)**, the second **Player 2**; both show a hand, then the host taps *Start match*. The host runs the physics (~20 Hz state snapshots) while each device tracks its own hand locally, so neither paddle feels laggy — banners and sounds are replayed on the guest so both sides experience the same match. If a player disconnects or closes the tab, the other bounces back to the menu with a notice. No dependencies, no internet needed beyond the hand-tracking model download.
 
 ## Performance Notes
 
@@ -73,21 +84,25 @@ Hand tracking is deliberately kept off the game's critical path:
 
 ## Controls
 
-| Action | VS AI | 2 Players |
-| --- | --- | --- |
-| Move paddle | Move your hand (or arrows / WASD) | P1: left hand · P2: right hand (split screen) |
-| Swing / serve | Swing through the ball (or <kbd>Space</kbd>) | Same — or <kbd>Space</kbd> (P1) / <kbd>Enter</kbd> (P2) |
-| Pause / resume | ⏸ button, <kbd>P</kbd> or <kbd>Esc</kbd> | same |
-| Sound on/off | 🔊 button | same |
+| Action | VS AI | 2 Players (one device) | LAN 2P (two devices) |
+| --- | --- | --- | --- |
+| Move paddle | Move your hand (or arrows / WASD) | P1: left hand · P2: right hand (split screen) | Your hand — each device tracks one player |
+| Swing / serve | Swing through the ball (or <kbd>Space</kbd>) | Same — or <kbd>Space</kbd> (P1) / <kbd>Enter</kbd> (P2) | Same — keyboard: WASD/arrows move, <kbd>Space</kbd> swings |
+| Pause / resume | ⏸ button, <kbd>P</kbd> or <kbd>Esc</kbd> | same | same — synced across both devices |
+| Sound on/off | 🔊 button | same | per-device |
 
 ## Run It
 
 No build step — plain HTML/CSS/JS with a vendored copy of Three.js. Internet is needed on first load (the hand-tracking model loads from a CDN, then caches).
 
 ```bash
-# serve the folder (any static server works), e.g.:
+# single device (any static server works), e.g.:
 python3 -m http.server 8000
 # then open http://localhost:8000
+
+# two devices on the same network (LAN multiplayer):
+node lan-server.js
+# then open the printed http://<ip>:8000 address on BOTH devices
 ```
 
 > **Camera access requires `localhost` or HTTPS.** If you deploy it, serve over HTTPS.

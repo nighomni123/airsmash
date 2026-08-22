@@ -67,6 +67,7 @@
         <div class="seg" id="mode-seg" role="radiogroup" aria-label="Game mode">
           <button data-mode="ai" class="on" role="radio" aria-checked="true">VS AI</button>
           <button data-mode="2p" role="radio" aria-checked="false">2 Players</button>
+          <button data-mode="lan" role="radio" aria-checked="false">LAN 2P</button>
         </div>
         <p class="mode-hint" id="mode-hint">One hand is your paddle.</p>
       </div>
@@ -101,9 +102,10 @@
       <div id="setup-progress" class="progress hidden"><div id="setup-progress-bar"></div></div>
     </div>
     <div class="setup-bottom card">
+      <p id="lan-note" class="lan-note hidden">Connecting to the LAN room…</p>
       <ol class="setup-steps">
         <li><b>Raise your hand</b> (both hands in 2-player mode), palm toward the camera — you'll see it in the preview above.</li>
-        <li><b>Move it around</b> — your paddle follows your palm. In 2P you face each other across the net: P1's view is the left half of the screen, P2's the right.</li>
+        <li><b>Move it around</b> — your paddle follows your palm. In 2P you face each other across the net: P1's view is the left half of the screen, P2's the right. Each player uses their own half of the camera.</li>
         <li><b>Swing through the ball</b> to return it. First to 11 wins (win by 2).</li>
       </ol>
       <button id="btn-start-match" class="btn btn-primary btn-big" disabled>Waiting for hand…</button>
