@@ -72,6 +72,38 @@ server.listen(PORT, async () => {
     check('normal difficulty preselected', await page.locator('#difficulty-seg button.on').getAttribute('data-diff') === 'normal');
     check('stats row present', await page.isVisible('#intro-stats'));
 
+    // Custom relay endpoint (deployed-site play): input appears only in
+    // LAN mode, normalizes bare hosts, and persists to localStorage.
+    check('relay row hidden outside LAN mode', !(await page.isVisible('#relay-row')));
+    await page.click('#mode-seg button[data-mode="lan"]');
+    check('relay row visible in LAN mode', await page.isVisible('#relay-row'));
+    await page.fill('#relay-input', 'example.com:9000');
+    await page.locator('#relay-input').evaluate(e => e.dispatchEvent(new Event('change')));
+    const savedRelay = await page.evaluate(() => window.__airsmash.state.lan.relayUrl);
+    check('relay URL normalizes bare host + appends /ws', savedRelay === 'ws://example.com:9000/ws',
+      String(savedRelay));
+    const storedRelay = await page.evaluate(() => localStorage.getItem('airsmash.relay.v1'));
+    check('relay URL persisted to localStorage', storedRelay === 'ws://example.com:9000/ws',
+      String(storedRelay));
+    // wss:// URLs pass through untouched; clearing the box reverts to same-origin.
+    await page.fill('#relay-input', 'wss://tls-relay.example.com');
+    await page.locator('#relay-input').evaluate(e => e.dispatchEvent(new Event('change')));
+    check('wss relay kept as-is',
+      (await page.evaluate(() => window.__airsmash.state.lan.relayUrl)) === 'wss://tls-relay.example.com/ws');
+    await page.fill('#relay-input', '');
+    await page.locator('#relay-input').evaluate(e => e.dispatchEvent(new Event('change')));
+    check('blank relay falls back to same origin',
+      (await page.evaluate(() => window.__airsmash.state.lan.relayUrl)) === null);
+    await page.click('#mode-seg button[data-mode="ai"]');
+    // ?relay= query param wins over everything.
+    const paramPage = await (await browser.newContext({ viewport: { width: 1280, height: 860 } })).newPage();
+    await paramPage.goto(`http://localhost:${PORT}/?test=1&relay=param-host:7000`, { waitUntil: 'domcontentloaded' });
+    await paramPage.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
+    check('?relay= param resolves and is remembered',
+      (await paramPage.evaluate(() => window.__airsmash.state.lan.relayUrl)) === 'ws://param-host:7000/ws'
+      && (await paramPage.evaluate(() => localStorage.getItem('airsmash.relay.v1'))) === 'ws://param-host:7000/ws');
+    await paramPage.context().close();
+
     // WebGL renderer initialized
     check('WebGL renderer created', await page.evaluate(() => !!window.__airsmash.renderer));
     check('game canvas has size', await page.evaluate(() => {

@@ -145,6 +145,7 @@ const state = {
     role: null,              // 'p1' | 'p2' | null (unassigned)
     connected: false,        // peer present in the room
     peerReady: false,
+    relayUrl: null,          // resolved relay WebSocket URL; null = same-origin /ws
     remoteMsg: null,         // newest host→guest state snapshot
     remotePad: null,         // newest guest→host paddle sample
     lastPadSent: 0,
@@ -231,6 +232,7 @@ function cacheDom() {
     'screen-intro', 'screen-setup', 'screen-error',
     'overlay-pause', 'overlay-gameover', 'toast',
     'mode-seg', 'mode-hint', 'difficulty-block', 'lan-note',
+    'relay-row', 'relay-input',
     'difficulty-seg', 'btn-start', 'stat-wins', 'stat-losses', 'stat-rally',
     'setup-status', 'setup-progress', 'setup-progress-bar',
     'btn-start-match', 'btn-keyboard-mode',
@@ -335,12 +337,13 @@ function syncModeUi() {
     btn.setAttribute('aria-checked', String(on));
   }
   el['difficulty-block'].classList.toggle('hidden', state.mode !== 'ai');
+  if (el['relay-row']) el['relay-row'].classList.toggle('hidden', state.mode !== 'lan');
   if (el['mode-hint']) {
     el['mode-hint'].textContent =
       state.mode === '2p'
         ? 'Split screen — P1 plays from the near end (left view), P2 from the far end (right view). Each hand uses half of the camera.'
         : state.mode === 'lan'
-          ? 'Two devices on the same Wi-Fi — run `node lan-server.js` and open the address it prints on both.'
+          ? 'Two devices, one relay — run `node lan-server.js`, or point the box below at a hosted relay.'
           : 'One hand is your paddle.';
   }
 }
@@ -2074,6 +2077,19 @@ function wireControls() {
   for (const btn of el['mode-seg'].querySelectorAll('button')) {
     btn.addEventListener('click', () => { ensureAudio(); setMode(btn.dataset.mode); });
   }
+  // Custom relay endpoint (deployed-site play). Saved on change; a blank
+  // field clears it and falls back to this site's own /ws.
+  el['relay-input'].addEventListener('change', () => {
+    ensureAudio();
+    const norm = setRelayInput(el['relay-input'].value);
+    el['relay-input'].value = norm || '';
+    if (state.lan.ws && state.screen === 'setup') {   // reconnect with the new endpoint
+      lanTeardown();
+      lanBeginSetup();
+    } else {
+      toast(norm ? `Relay saved — ${relayLabel()}` : 'Using this site as the relay');
+    }
+  });
   for (const btn of el['difficulty-seg'].querySelectorAll('button')) {
     btn.addEventListener('click', () => setDifficulty(btn.dataset.diff));
   }
@@ -2240,11 +2256,70 @@ function frame(ts) {
    never simulates. Banners + sounds are replayed on the guest via small
    events so both sides see and hear the same match. */
 
+/* ---- Relay endpoint (option 3: play from a deployed site) ----
+   Priority: ?relay=<url> query param → saved localStorage value →
+   same-origin `/ws` (the bundled lan-server.js). Accepts bare hosts
+   ('my-relay.fly.dev', 'host:8080'), http(s) URLs (converted), or full
+   ws(s):// URLs; a missing path gets '/ws' appended. */
+
+const RELAY_KEY = 'airsmash.relay.v1';
+
+function normalizeRelayUrl(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return null;
+  let u;
+  try {
+    u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(v)
+      ? v
+      : `${location.protocol === 'https:' ? 'wss' : 'ws'}://${v}`);
+  } catch {
+    return null;
+  }
+  if (u.protocol === 'https:') u.protocol = 'wss:';
+  else if (u.protocol === 'http:') u.protocol = 'ws:';
+  if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
+  if (u.pathname === '/' || u.pathname === '') u.pathname = '/ws';
+  return u.toString();
+}
+
+function resolveRelayUrl() {
+  try {
+    const param = new URLSearchParams(location.search).get('relay');
+    if (param) {
+      const norm = normalizeRelayUrl(param);
+      if (norm) localStorage.setItem(RELAY_KEY, norm);   // remember for next visit
+      return norm;                                       // null param value falls back below
+    }
+    const saved = localStorage.getItem(RELAY_KEY);
+    if (saved) return normalizeRelayUrl(saved);
+  } catch { /* storage may be unavailable */ }
+  return null;
+}
+
+// Human-readable target for the lobby note.
+function relayLabel() {
+  if (!state.lan.relayUrl) return 'this site';
+  try { return new URL(state.lan.relayUrl).host; } catch { return state.lan.relayUrl; }
+}
+
+// Save/clear the custom relay from the intro input. Returns normalized URL.
+function setRelayInput(raw) {
+  const norm = normalizeRelayUrl(raw);
+  try {
+    if (norm) localStorage.setItem(RELAY_KEY, norm);
+    else localStorage.removeItem(RELAY_KEY);
+  } catch { /* ignore */ }
+  state.lan.relayUrl = resolveRelayUrl();
+  return norm;
+}
+
 function lanConnect() {
   if (state.lan.ws && (state.lan.ws.readyState === 0 || state.lan.ws.readyState === 1)) return;
   let ws;
   try {
-    ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    const url = state.lan.relayUrl
+      || ((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    ws = new WebSocket(url);
   } catch {
     lanUnavailable();
     return;
@@ -2284,7 +2359,9 @@ function lanSend(obj) {
 
 function lanUnavailable() {
   showError('LAN server unreachable',
-    'LAN play needs the bundled server. On one device run: node lan-server.js — then open the address it prints on BOTH devices.');
+    state.lan.relayUrl
+      ? `Could not reach the relay at ${relayLabel()}. Is \`node lan-server.js\` running there (and serving /ws)? Fix the address in the “Relay server” box on the menu.`
+      : 'LAN play needs the bundled relay. On one device run: node lan-server.js — then open the address it prints on BOTH devices. Playing from a deployed site? Paste a relay address in the “Relay server” box on the menu.');
 }
 
 function lanResetConn() {
@@ -2309,7 +2386,7 @@ function lanBeginSetup() {
   el['lan-note'].classList.remove('hidden');
   state.lan.peerReady = false;
   state.lan.lastReadySent = null;
-  lanUpdateNote('Connecting to the LAN room…');
+  lanUpdateNote(`Connecting to the relay (${relayLabel()})…`);
   lanConnect();
 }
 
@@ -2592,6 +2669,8 @@ window.__airsmash = {
 
 document.addEventListener('DOMContentLoaded', () => {
   cacheDom();
+  state.lan.relayUrl = resolveRelayUrl();
+  if (el['relay-input'] && state.lan.relayUrl) el['relay-input'].value = state.lan.relayUrl;
   previewCtx = el.preview.getContext('2d');
   confettiCtx = el.confetti.getContext('2d');
 

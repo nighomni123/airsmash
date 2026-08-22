@@ -316,6 +316,31 @@ button { font-family: inherit; cursor: pointer; }
   text-align: center;
 }
 
+/* Custom relay endpoint (intro screen, LAN mode only) — lets a deployed
+   site point at any machine running lan-server.js. */
+.relay-row {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.relay-row input {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 9px 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.relay-row input::placeholder { color: var(--ink-dim); }
+.relay-row input:focus { outline: none; border-color: var(--cyan); }
+.relay-hint { font-size: 11px; color: var(--ink-dim); margin: 0; }
+.relay-hint code { color: var(--cyan); font-size: 10.5px; }
+
 .seg {
   display: flex;
   background: var(--panel);

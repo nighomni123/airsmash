@@ -70,6 +70,11 @@
           <button data-mode="lan" role="radio" aria-checked="false">LAN 2P</button>
         </div>
         <p class="mode-hint" id="mode-hint">One hand is your paddle.</p>
+        <div class="relay-row hidden" id="relay-row">
+          <input id="relay-input" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+                 placeholder="Relay server — e.g. my-relay.fly.dev (blank = this site)" />
+          <p class="relay-hint">Playing from a deployed site? Point at any machine running <code>lan-server.js</code>. Leave blank to use this site itself.</p>
+        </div>
       </div>
 
       <div class="difficulty-block" id="difficulty-block">

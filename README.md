@@ -62,6 +62,10 @@ node lan-server.js 8080     # custom port
 
 Open the printed `http://<ip>:<port>` address on both devices. The first device to connect is **Player 1 (host)**, the second **Player 2**; both show a hand, then the host taps *Start match*. The host runs the physics (~20 Hz state snapshots) while each device tracks its own hand locally, so neither paddle feels laggy — banners and sounds are replayed on the guest so both sides experience the same match. If a player disconnects or closes the tab, the other bounces back to the menu with a notice. No dependencies, no internet needed beyond the hand-tracking model download.
 
+### Playing from a deployed site
+
+A static host (GitHub Pages, Vercel…) can't relay WebSockets, so LAN 2P from a deployment needs a *relay*: any machine running `lan-server.js` — your own computer while you play, or a free Node host (Render / Railway / Fly). Pick **LAN 2P** on the menu and paste the relay's address into the **Relay server** box (e.g. `my-relay.fly.dev`), then share the deployed site's link with the other player. The address is remembered between visits; `?relay=<address>` in the URL works too. Leave the box blank to use the site itself as the relay (i.e. when it's served by `lan-server.js` directly).
+
 ## Performance Notes
 
 Hand tracking is deliberately kept off the game's critical path:
