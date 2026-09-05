@@ -367,6 +367,43 @@ button { font-family: inherit; cursor: pointer; }
   box-shadow: var(--glow-accent);
 }
 
+.pose-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.pose-row input { width: 16px; height: 16px; accent-color: var(--accent); }
+.pose-row small { font-weight: 500; opacity: 0.75; }
+
+.calib-block {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+  text-align: center;
+}
+.calib-block p { font-size: 13px; }
+.calib-block .progress {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(120, 160, 255, 0.15);
+  overflow: hidden;
+}
+#calib-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--gold), var(--accent));
+  transition: width 0.2s ease;
+}
+.btn-small { padding: 8px 16px; font-size: 13px; }
+
 /* ---------- Buttons ---------- */
 
 .btn {

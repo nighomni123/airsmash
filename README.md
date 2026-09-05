@@ -37,7 +37,7 @@ Motion games died with the console generation that hosted them — but every lap
 1. **Start playing**, pick a mode, and allow camera access.
 2. **Raise your hand** (both hands in 2-player mode; one per device in LAN mode), palm toward the camera. When you see it in the preview, hit **Start match**.
 3. **Move your hand** left/right and up/down — the paddle mirrors you in 3D. In 2-player you face each other across the net: P1's POV fills the left half of the screen, P2's the right, and each hand drives its own paddle from its own half of the camera.
-4. **Swing through the ball** to return it. Your swing speed adds power; your swing direction steers the shot. After a serve or return, the *other* player must hit it back.
+4. **Swing through the ball** to return it. Your swing speed adds power; your swing direction steers the shot. After a serve or return, the *other* player must hit it back. As the ball closes in on you it briefly glides in slow motion (the ball glows as time dilates) — a short window to line your paddle up — while your hand stays full-speed.
 5. **Your serve**: the ball floats beside your paddle — swipe through it to launch.
 6. **First to 11 wins** (win by 2; sudden death at 15). Serve alternates every 2 points.
 

@@ -6,14 +6,20 @@
   <meta name="theme-color" content="#070b16">
   <title>AirSmash — 3D Air Table Tennis</title>
   <meta name="description" content="First-person 3D table tennis against the AI, played with your real hand on camera. No controllers — your hand is the paddle.">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%93%3C/text%3E%3C/svg%3E">
   <script type="importmap">
     { "imports": { "three": "./vendor/three.module.js" } }
   </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <!-- Warm up the MediaPipe bundle + model CDNs before the setup screen asks for them -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="preconnect" href="https://storage.googleapis.com" crossorigin>
+  <!-- Stream/parse the ES modules without blocking HTML parsing -->
+  <link rel="modulepreload" href="./vendor/three.module.js">
+  <link rel="modulepreload" href="app.js">
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%93%3C/text%3E%3C/svg%3E">
 </head>
 <body>
   <!-- Hidden camera feed: the HandLandmarker reads frames from this element. -->
@@ -86,6 +92,11 @@
         </div>
       </div>
 
+      <label class="pose-row" title="Optional torso lean nudge (beta, on-device)">
+        <input type="checkbox" id="pose-opt" />
+        <span>Body lean <small>(beta, optional)</small></span>
+      </label>
+
       <button id="btn-start" class="btn btn-primary btn-big">Start playing</button>
 
       <div class="stats-row" id="intro-stats">
@@ -105,12 +116,17 @@
       <h2>Get ready</h2>
       <p id="setup-status">Starting camera…</p>
       <div id="setup-progress" class="progress hidden"><div id="setup-progress-bar"></div></div>
+      <div id="calib-block" class="calib-block hidden">
+        <p id="calib-status">Hold your open palm steady…</p>
+        <div class="progress"><div id="calib-bar"></div></div>
+        <button id="btn-calib-skip" class="btn btn-ghost btn-small" type="button">Skip calibration</button>
+      </div>
     </div>
     <div class="setup-bottom card">
       <p id="lan-note" class="lan-note hidden">Connecting to the LAN room…</p>
       <ol class="setup-steps">
-        <li><b>Raise your hand</b> (both hands in 2-player mode), palm toward the camera — you'll see it in the preview above.</li>
-        <li><b>Move it around</b> — your paddle follows your palm. In 2P you face each other across the net: P1's view is the left half of the screen, P2's the right. Each player uses their own half of the camera.</li>
+        <li><b>Raise your hand or forearm</b> (both hands in 2-player mode), palm toward the camera — you'll see it in the preview above. Losing the palm is fine: your wrist keeps the paddle alive.</li>
+        <li><b>Hold steady, then swing</b> — P1 calibrates once (palm size + forehand side) so punches hit harder and wrist roll aims. P2 stays classic palm-follow.</li>
         <li><b>Swing through the ball</b> to return it. First to 11 wins (win by 2).</li>
       </ol>
       <button id="btn-start-match" class="btn btn-primary btn-big" disabled>Waiting for hand…</button>

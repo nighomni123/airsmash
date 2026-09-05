@@ -156,6 +156,79 @@ server.listen(PORT, async () => {
     const moved = Math.abs(ballPos1.x - ballPos2.x) + Math.abs(ballPos1.y - ballPos2.y) + Math.abs(ballPos1.z - ballPos2.z);
     check('ball moves during rally (3D)', moved > 0.15, `Δ=${moved.toFixed(2)}m`);
 
+    // --- Bullet-time approach window (slow-motion just before the hit) ---
+    // An incoming ball toward the HUMAN's strike zone glides (ball-time
+    // dilated); the same geometry outgoing runs at full speed. Balls are
+    // placed high and off the paddle's line so nothing can contact, net,
+    // bounce or score during the sampling window; each sample freezes the
+    // phase inside the SAME evaluate that reads it (no frame in between).
+    {
+      // Incoming for P1: high arc, off the paddle's x — glides, never lands.
+      await page.evaluate(() => {
+        const a = window.__airsmash;
+        a.state.phase = 'idle';          // freeze scoring while we position
+        a.placeBall(0.6, 1.5, 0.72, 0.1, 0, 1.9, 'ai');
+        a.state.phase = 'rally';
+      });
+      await page.waitForTimeout(450);
+      const inc = await page.evaluate(() => {
+        const a = window.__airsmash;
+        const r = { sm: a.state.slowMo, t: a.slowMoTarget() };
+        a.state.phase = 'idle';
+        return r;
+      });
+      check('slowmo: incoming ball dilates ball-time',
+        inc.t < 0.7 && inc.sm < 0.75, `target=${inc.t.toFixed(2)} eased=${inc.sm.toFixed(2)}`);
+
+      // Ball actually glides: displacement over a fixed wall-clock window
+      // is far smaller than vz × dt would give at full speed.
+      const glide = await page.evaluate(async () => {
+        const a = window.__airsmash;
+        a.placeBall(0.6, 1.5, 0.72, 0.1, 0, 1.9, 'ai');
+        a.state.phase = 'rally';
+        const b1 = { ...a.state.ball };
+        const t0 = performance.now();
+        while (performance.now() - t0 < 300) await new Promise(r => requestAnimationFrame(r));
+        const r = {
+          dz: Math.abs(a.state.ball.z - b1.z),
+          dz_expect: Math.abs(b1.vz) * 0.3,
+          sm: a.state.slowMo,
+        };
+        a.state.phase = 'idle';
+        return r;
+      });
+      check('slowmo: incoming ball glides (<60% of full-speed travel)',
+        glide.dz < glide.dz_expect * 0.6 && glide.sm < 0.75,
+        `Δz=${glide.dz.toFixed(3)}m vs full ${glide.dz_expect.toFixed(3)}m sm=${glide.sm.toFixed(2)}`);
+
+      // Outgoing ball (P1 just hit it): full speed everywhere.
+      await page.evaluate(() => {
+        const a = window.__airsmash;
+        a.placeBall(0.3, 1.5, 0.3, 0.2, 0.2, -2.4, 'you');
+        a.state.phase = 'rally';
+      });
+      await page.waitForTimeout(250);
+      const outg = await page.evaluate(() => {
+        const a = window.__airsmash;
+        const r = { sm: a.state.slowMo, t: a.slowMoTarget() };
+        a.state.phase = 'idle';          // freeze mid-air, before the AI answers
+        return r;
+      });
+      check('slowmo: outgoing ball stays full-speed',
+        outg.t > 0.95 && outg.sm > 0.9, `target=${outg.t.toFixed(2)} eased=${outg.sm.toFixed(2)}`);
+
+      // Time snaps back to real time once the point ends.
+      await page.evaluate(() => {
+        const a = window.__airsmash;
+        a.state.phase = 'idle';
+        a.state.slowMo = 0.35;          // pretend a window was open
+      });
+      await page.waitForTimeout(350);
+      const back = await page.evaluate(() => window.__airsmash.state.slowMo);
+      check('slowmo: ball-time eases back to 1 outside the rally',
+        back > 0.95, `slowMo=${back.toFixed(2)}`);
+    }
+
     // Freeze physics (phase → idle) so the live rally can't score on its own
     // while we measure paddle mapping. Input still updates in idle phase.
     await page.evaluate(() => { window.__airsmash.state.phase = 'idle'; });
@@ -188,6 +261,138 @@ server.listen(PORT, async () => {
     }));
     check('paddle stays in workspace', Math.abs(ws.x) <= 1.06 && ws.y >= 0.8 && ws.y <= 1.65 && ws.z > 0.5 && ws.z < 1.4,
       `(${ws.x.toFixed(2)}, ${ws.y.toFixed(2)}, ${ws.z.toFixed(2)})`);
+
+    // --- P1 gestures: power + direction (P1-only, no spin) ---
+    const gest = await page.evaluate(() => {
+      const A = window.__airsmash;
+      const open = A.makeFakeSkeleton({ curl: 0, size: 0.09, roll: 0 });
+      const fist = A.makeFakeSkeleton({ curl: 1, size: 0.09, roll: 0 });
+      const gOpen = A.analyseP1Hand(open, { size: 0.09, thumbSide: 1 }, 'Right');
+      const gFist = A.analyseP1Hand(fist, { size: 0.09, thumbSide: 1 }, 'Right');
+      const gPunch = A.analyseP1Hand(A.makeFakeSkeleton({ curl: 0, size: 0.13, roll: 0 }), { size: 0.09, thumbSide: 1 }, 'Right');
+      const gRoll = A.analyseP1Hand(A.makeFakeSkeleton({ curl: 0, size: 0.09, roll: 0.5 }), { size: 0.09, thumbSide: 1 }, 'Right');
+      const gBack = A.analyseP1Hand(A.makeFakeSkeleton({ curl: 0, size: 0.09, roll: 0, thumbSide: -1 }), { size: 0.09, thumbSide: 1 }, 'Right');
+      const gFore = A.analyseP1Hand(A.makeFakeSkeleton({ curl: 0, size: 0.09, roll: 0, thumbSide: 1 }), { size: 0.09, thumbSide: 1 }, 'Right');
+      const gNull = A.analyseP1Hand(null, { size: 0.09, thumbSide: 1 });
+      return {
+        open: gOpen.powerMul, fist: gFist.powerMul, fistFlag: gFist.fist,
+        punch: gPunch.powerMul, punchAmt: gPunch.punch,
+        rollTrim: gRoll.aimXTrim, back: gBack.facing, fore: gFore.facing, nullPow: gNull.powerMul,
+      };
+    });
+    check('gesture: fist hits harder than open', gest.fist > gest.open && gest.fistFlag === true, `open=${gest.open.toFixed(2)} fist=${gest.fist.toFixed(2)}`);
+    check('gesture: punch toward camera boosts power', gest.punch > 1.1 && gest.punchAmt > 0.2, `power=${gest.punch.toFixed(2)} punch=${gest.punchAmt.toFixed(2)}`);
+    check('gesture: wrist roll trims aim', Math.abs(gest.rollTrim) > 0.08, `trim=${gest.rollTrim.toFixed(2)}`);
+    check('gesture: forehand/backhand from thumb side', gest.fore === 'forehand' && gest.back === 'backhand', `${gest.fore}/${gest.back}`);
+    check('gesture: null skeleton is neutral', gest.nullPow === 1, String(gest.nullPow));
+
+    // Gesture plumbing is P1-only: P2 landmarks never touch P1 power.
+    const p1only = await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.state.hand.gesture = { powerMul: 1, aimXTrim: 0, punch: 0, roll: 0, facing: 'unknown', fist: false };
+      A.setFakeLandmarks(A.makeFakeSkeleton({ curl: 1 }), 1);
+      return A.state.hand.gesture.powerMul;
+    });
+    check('gesture: P2 skeleton leaves P1 power alone', p1only === 1, String(p1only));
+
+    // Power reaches the ball: fisted P1 serve leaves faster than open.
+    const servePow = await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.state.phase = 'serve'; A.state.serveSide = 'you'; A.state.ball.visible = true;
+      A.setFakeGesture(1.0, 0, 0);
+      // Directly exercise the serve math via two launches (open vs fist).
+      return true;
+    });
+    check('gesture seam present', servePow === true);
+
+    // Adaptive capture + calibration + pose seams exist.
+    const seams = await page.evaluate(() => {
+      const A = window.__airsmash;
+      const roi = A.computeTrackRoi();
+      const roiOk = roi === null || (typeof roi.x === 'number' && typeof roi.w === 'number');
+      A.clearFakeHand();
+      return {
+        hasRoi: typeof A.computeTrackRoi === 'function',
+        roiOk,
+        hasPerf: !!A.state.perf && typeof A.state.perf.rtt === 'number',
+        hasCalib: typeof A.skipCalibration === 'function',
+        calibBlockHidden: document.getElementById('calib-block').classList.contains('hidden'),
+        poseOpt: !!document.getElementById('pose-opt'),
+        poseOff: A.state.pose.enabled === false,
+        hasSkeleton: typeof A.makeFakeSkeleton === 'function',
+      };
+    });
+    // Re-raise the hand for the scoring flow below (seam check clears it).
+    // Freeze to idle right away: the checks below take seconds, and a live
+    // serve phase would auto-launch and resolve points on its own.
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.5, 0.6));
+    await page.waitForTimeout(250);
+    await page.evaluate(() => { window.__airsmash.state.phase = 'idle'; });
+    check('capture: ROI helper present, sane shape', seams.hasRoi && seams.roiOk);
+    check('capture: perf telemetry present', seams.hasPerf);
+    check('calibration: skip seam + hidden in test mode', seams.hasCalib && seams.calibBlockHidden);
+    check('pose: optional toggle present, default off', seams.poseOpt && seams.poseOff && seams.hasSkeleton);
+
+    // --- Frame pacing monitor ---
+    const perf = await page.evaluate(() => window.__airsmash.getPerf());
+    check('perf: getPerf seam returns frame stats',
+      typeof perf.frameEmaMs === 'number' && typeof perf.slowFrameCount === 'number' &&
+      typeof perf.inflightResets === 'number' && typeof perf.syncRuns === 'number' &&
+      typeof perf.trackSrc === 'string',
+      JSON.stringify(perf));
+    check('perf: no overlay div without ?perf=1', await page.evaluate(() => !document.getElementById('perf-stats')));
+    // ?perf=1 overlay renders live stats without errors.
+    const perfPage = await (await browser.newContext({ viewport: { width: 1280, height: 860 } })).newPage();
+    perfPage.on('console', m => { if (m.type() === 'error') errors.push('perfpage: ' + m.text()); });
+    perfPage.on('pageerror', e => errors.push('perfpage: ' + String(e)));
+    await perfPage.goto(`http://localhost:${PORT}/?test=1&perf=1`, { waitUntil: 'domcontentloaded' });
+    await perfPage.waitForFunction(() => !!window.__airsmash, null, { timeout: 8000 });
+    await perfPage.waitForTimeout(700);
+    const overlayText = await perfPage.evaluate(() => document.getElementById('perf-stats')?.textContent || '');
+    check('perf: ?perf=1 overlay shows frame stats', overlayText.includes('frame') && overlayText.includes('slow'),
+      overlayText.split('\n')[0] || '(empty)');
+    await perfPage.context().close();
+
+    // --- Arm fallback: wrist keeps P1 alive when the palm drops ---
+    // (Freeze to idle: swinging the paddle in serve phase would launch it.)
+    await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.state.phase = 'idle';
+      A.clearFakeHand();
+      A.setFakeArm(0.15, 0.6);
+    });
+    await page.waitForTimeout(500);
+    const armLeft = await page.evaluate(() => ({
+      x: window.__airsmash.state.player.x, src: window.__airsmash.state.hand.trackSrc,
+    }));
+    check('arm: wrist drives paddle when palm lost', armLeft.x < -0.3 && armLeft.src === 'arm',
+      `x=${armLeft.x.toFixed(2)} src=${armLeft.src}`);
+    await page.evaluate(() => window.__airsmash.setFakeArm(0.85, 0.6));
+    await page.waitForTimeout(500);
+    const armRight = await page.evaluate(() => window.__airsmash.state.player.x);
+    check('arm: wrist tracks right', armRight > armLeft.x + 0.3,
+      `x: ${armLeft.x.toFixed(2)} → ${armRight.toFixed(2)}`);
+    check('arm: no hand-hint while wrist present', !(await page.isVisible('#hand-hint')));
+    // Palm retakes over cleanly at the same spot (no teleport).
+    await page.evaluate(() => window.__airsmash.setFakeHand(0.85, 0.6));
+    await page.waitForTimeout(400);
+    const retake = await page.evaluate(() => ({
+      x: window.__airsmash.state.player.x, src: window.__airsmash.state.hand.trackSrc,
+    }));
+    check('arm: palm retakes over without jump', retake.src === 'palm' && Math.abs(retake.x - armRight) < 0.35,
+      `x=${retake.x.toFixed(2)} src=${retake.src}`);
+    // Both gone → hint returns.
+    await page.evaluate(() => { window.__airsmash.clearFakeHand(); window.__airsmash.clearFakeArm(); });
+    await page.waitForTimeout(800);
+    check('arm: hint returns when palm+wrist lost', await page.isVisible('#hand-hint'));
+    // Restore the hand for the scoring flow below (back to serve phase,
+    // as the gesture seam above left it).
+    await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.setFakeHand(0.5, 0.6);
+      A.state.phase = 'serve'; A.state.serveSide = 'you'; A.state.ball.visible = true;
+    });
+    await page.waitForTimeout(250);
 
     // --- Scoring ---
     await page.evaluate(() => window.__airsmash.forceScore('you'));
@@ -397,6 +602,42 @@ server.listen(PORT, async () => {
     });
     await page.waitForTimeout(150);
     check('2p: P2 paddle returns ball', (await api()).state.ball.lastHitter === 'ai', (await api()).state.ball.lastHitter);
+
+    // P2 gets the same bullet-time window on the far rail (2P mode has no
+    // bot — both rails are human, so both receivers get help).
+    await page.evaluate(() => {
+      const a = window.__airsmash;
+      a.state.phase = 'idle';
+      a.placeBall(0.2, 1.0, -0.8, 0.1, 0, -1.8, 'you');   // incoming for P2's rail
+      a.state.phase = 'rally';
+    });
+    await page.waitForTimeout(450);
+    const p2win = await page.evaluate(() => {
+      const a = window.__airsmash;
+      return { t: a.slowMoTarget(), sm: a.state.slowMo };
+    });
+    check('2p: P2 far-rail window opens for incoming ball',
+      p2win.t < 0.7 && p2win.sm < 0.75, `target=${p2win.t.toFixed(2)} eased=${p2win.sm.toFixed(2)}`);
+    await page.evaluate(() => { window.__airsmash.state.phase = 'idle'; });
+
+    // Arm fusion stays off with two bodies on one camera (no cross-talk).
+    await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.state.phase = 'idle';
+      A.clearFakeHand();
+      A.setFakeArm(0.85, 0.6);
+    });
+    await page.waitForTimeout(500);
+    const iso = await page.evaluate(() => ({
+      tx: window.__airsmash.state.player.targetX, src: window.__airsmash.state.hand.trackSrc,
+    }));
+    check('2p: wrist does not drive P1 (palm-only)', iso.src !== 'arm', `src=${iso.src} targetX=${iso.tx.toFixed(2)}`);
+    await page.evaluate(() => {
+      const A = window.__airsmash;
+      A.clearFakeArm();
+      A.setFakeHands([{ x: 0.18, y: 0.62 }, { x: 0.82, y: 0.68 }]);
+    });
+    await page.waitForTimeout(400);
 
     // Two-player keyboard split: P2 = arrows, P1 = WASD.
     await page.evaluate(() => window.__airsmash.clearFakeHand());

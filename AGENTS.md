@@ -207,6 +207,8 @@ node verify.js     # automated playthrough; must end with "ALL CHECKS PASSED"
 
 **Change ball physics**: `GRAVITY`, `RESTITUTION`, `BALL_R`, power scaling in `playerReturn()` / `aiReturn()`, net clearance margin in `solveShot()`.
 
+**Tune the bullet-time approach window**: `SLOWMO_SCALE` (ball-time fraction deep in the strike zone; 0.35 ≈ 3× longer to align), `SLOWMO_ZONE_Z` (zone entry just past the net, matches the ±0.22 hit gates in `stepPlayerHit`), `SLOWMO_RATE` (per-second easing between 1 and `SLOWMO_SCALE`). Window logic lives in `slowMoTarget()` — VS-AI: incoming = `lastHitter 'ai'` + `vz > 0` toward P1's rail; 2P/LAN: a `lastHitter 'you'` + `vz < 0` ball opens one for the human far rail too; the bot never gets a window. Easing + the soft sweep cue are in `updateSlowMo()`; consumption is `stepBall(dt * state.slowMo)` in `update()`'s rally branch (hands/camera/AI keep real dt); ball-glow feedback rides `state.slowMo` in `renderScene()`. Tests: the `slowmo:` and `2p: P2 far-rail` checks in verify.js.
+
 **Move the camera**: `world.camera.position` / `lookAt` in `initThree()` and the sway in `renderScene()`; portrait FOV in `layout()`.
 
 **Add a control/button**: add markup in `index.html`, style in `style.css`, register the id in `cacheDom()`'s `ids` array, wire it in `wireControls()`. If it mutates state, call `saveGame()` if it should persist.

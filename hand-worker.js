@@ -6,13 +6,18 @@
    the CPU delegate. Running it on the main thread stalls the
    render loop (the whole game judders at the inference rate).
    Here the main thread only grabs a frame (`createImageBitmap`,
-   async + cheap) and transfers it; all inference happens here.
+   async + cheap, downscaled ROI crop) and transfers it; all
+   inference happens here.
 
    Protocol (postMessage):
      → { type: 'init' }
      ← { type: 'ready' } | { type: 'error', message }
-     → { type: 'frame', bitmap: ImageBitmap, ts }   (bitmap transferred)
-     ← { type: 'result', hands: [ [ {x,y} × 21 ] ], ts }
+     → { type: 'frame', bitmap: ImageBitmap, ts, roi, numHands }
+       (bitmap transferred; roi = full-frame fractions or null)
+     ← { type: 'result', hands: [ {pts:[{x,y,z}×21], hand} ],
+         handed, ts, roi, inferMs }
+       (pts are in BITMAP space when roi is set — the main thread
+       maps them back to full-frame video coords)
    ============================================================ */
 
 'use strict';
@@ -32,7 +37,7 @@ async function init() {
   const opts = (delegate) => ({
     baseOptions: { modelAssetPath: MP_MODEL, delegate },
     runningMode: 'VIDEO',
-    numHands: 2,                     // two-player mode tracks both hands
+    numHands: 2,                     // capped per-message in the main thread
     minHandDetectionConfidence: 0.5,
     minHandPresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,
@@ -60,7 +65,7 @@ self.onmessage = (e) => {
     const bmp = msg.bitmap;
     if (!landmarker) {
       if (bmp && bmp.close) bmp.close();
-      postMessage({ type: 'result', hands: [], ts: msg.ts });
+      postMessage({ type: 'result', hands: [], handed: [], ts: msg.ts, roi: msg.roi || null, inferMs: 0 });
       return;
     }
     // detectForVideo requires strictly increasing int timestamps.
@@ -68,16 +73,29 @@ self.onmessage = (e) => {
     lastTs = ts;
 
     const hands = [];
+    const handed = [];
+    let inferMs = 0;
     try {
+      const t0 = performance.now();
       const res = landmarker.detectForVideo(bmp, ts);
+      inferMs = performance.now() - t0;
       const lms = (res && res.landmarks) || [];
-      for (const lm of lms) {
+      const rawHanded = (res && res.handedness) || [];
+      const want = Math.min(msg.numHands || 2, 2);
+      for (let hi = 0; hi < lms.length && hands.length < want; hi++) {
+        const lm = lms[hi];
         const out = new Array(lm.length);
-        for (let i = 0; i < lm.length; i++) out[i] = { x: lm[i].x, y: lm[i].y };
-        hands.push(out);
+        for (let i = 0; i < lm.length; i++) out[i] = { x: lm[i].x, y: lm[i].y, z: lm[i].z || 0 };
+        let hand = null;
+        try {
+          const h = rawHanded[hi] && rawHanded[hi][0];
+          hand = (h && (h.categoryName || h.displayName)) || null;
+        } catch { hand = null; }
+        hands.push({ pts: out, hand });
+        handed.push(rawHanded[hi] || null);
       }
     } catch { /* a bad frame must never kill the worker */ }
     if (bmp && bmp.close) bmp.close();
-    postMessage({ type: 'result', hands, ts });
+    postMessage({ type: 'result', hands, handed, ts: msg.ts, roi: msg.roi || null, inferMs });
   }
 };
