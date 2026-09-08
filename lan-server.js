@@ -33,7 +33,6 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
-  '.webmanifest': 'application/manifest+json',
   '.task': 'application/octet-stream',
 };
 
@@ -82,7 +81,7 @@ function wsEncode(text) {
 }
 
 // Feed raw bytes; returns an array of decoded text messages.
-function wsDecode(chunk, state) {
+function wsDecode(chunk, state, socket) {
   const out = [];
   state.buf = state.buf && state.buf.length ? Buffer.concat([state.buf, chunk]) : chunk;
 
@@ -140,6 +139,10 @@ function wsEncodeControl(opcode, payload) {
 /* ---------- Room: exactly two peers, first = P1 ---------- */
 
 const room = [];   // [{ socket, role, state }]
+let roomCode = null;   // optional 4-digit code set by the first peer; the second must match
+
+const HEARTBEAT_MS = 15000;           // server → client ping interval
+const HEARTBEAT_TIMEOUT_MS = 60000;   // drop a peer with no traffic for this long
 
 function send(conn, obj) {
   try { conn.socket.write(wsEncode(JSON.stringify(obj))); } catch { /* ignore */ }
@@ -156,11 +159,55 @@ function broadcastPeers() {
   for (const c of room) send(c, { t: 'peers', n: room.length });
 }
 
+function dropConn(conn) {
+  const i = room.indexOf(conn);
+  if (i >= 0) room.splice(i, 1);
+  if (room.length === 0) roomCode = null;   // room empty → clear the locked code
+  broadcastPeers();                          // survivor sees n drop to 1 (or 0)
+}
+
+// Heartbeat: ping every peer; drop anyone with no traffic for HEARTBEAT_TIMEOUT_MS.
+// Keeps NAT/router mappings alive and detects silently-dead sockets — the previous
+// ping/pong reply was broken because wsDecode had no `socket` in scope, so no pong
+// was ever sent and there was zero connection liveness in either direction.
+setInterval(() => {
+  const now = Date.now();
+  for (const c of room) {
+    try { c.socket.write(wsEncodeControl(0x89, Buffer.alloc(0))); } catch { /* ignore */ }
+    if (now - (c.state.lastSeen || 0) > HEARTBEAT_TIMEOUT_MS) {
+      try { c.socket.destroy(); } catch { /* ignore */ }
+      dropConn(c);
+    }
+  }
+}, HEARTBEAT_MS);
+
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
   if (!key || req.headers.upgrade?.toLowerCase() !== 'websocket') {
     socket.destroy(); return;
   }
+
+  // Optional 4-digit room code (?code=). Backward compatible: if neither peer
+  // sets a code, the room stays open. The first peer to connect locks in the
+  // code; the second must match it — this closes the relay-URL hole where
+  // anyone who knows the (public) relay address could join the room.
+  let code = null;
+  try {
+    const u = new URL(req.url || '/', 'http://localhost');
+    code = u.searchParams.get('code');
+  } catch { /* ignore */ }
+
+  if (room.length >= 2) {                   // third connection → room full
+    socket.write(wsEncode(JSON.stringify({ t: 'full' })));
+    socket.end();
+    return;
+  }
+  if (room.length === 1 && roomCode && code !== roomCode) {
+    socket.write(wsEncode(JSON.stringify({ t: 'full' })));
+    socket.end();
+    return;
+  }
+
   socket.write(
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
@@ -168,24 +215,21 @@ server.on('upgrade', (req, socket) => {
     `Sec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`
   );
 
-  if (room.length >= 2) {
-    socket.write(wsEncode(JSON.stringify({ t: 'full' })));
-    socket.end();
-    return;
-  }
+  if (room.length === 0 && code) roomCode = code;   // first peer locks the code
 
   const conn = {
     socket,
     role: room.length === 0 ? 'p1' : 'p2',
-    state: { buf: null, frag: null, dead: false },
+    state: { buf: null, frag: null, dead: false, lastSeen: Date.now() },
   };
   room.push(conn);
   send(conn, { t: 'welcome', role: conn.role });
   broadcastPeers();
 
   socket.on('data', (chunk) => {
+    conn.state.lastSeen = Date.now();        // any received traffic counts as alive
     try {
-      for (const text of wsDecode(chunk, conn.state)) {
+      for (const text of wsDecode(chunk, conn.state, socket)) {
         if (conn.state.dead) { socket.end(); break; }
         relay(conn, text);                    // dumb relay: game logic lives in the browsers
       }
@@ -194,14 +238,9 @@ server.on('upgrade', (req, socket) => {
     }
   });
 
-  const drop = () => {
-    const i = room.indexOf(conn);
-    if (i >= 0) room.splice(i, 1);
-    broadcastPeers();                       // survivor sees n drop to 1 (or 0)
-  };
-  socket.on('close', drop);
-  socket.on('error', drop);
-  socket.on('end', drop);
+  socket.on('close', () => dropConn(conn));
+  socket.on('error', () => dropConn(conn));
+  socket.on('end', () => dropConn(conn));
 });
 
 server.listen(PORT, () => {

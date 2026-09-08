@@ -80,6 +80,9 @@
           <input id="relay-input" type="url" inputmode="url" autocomplete="off" spellcheck="false"
                  placeholder="Relay server — e.g. my-relay.fly.dev (blank = this site)" />
           <p class="relay-hint">Playing from a deployed site? Point at any machine running <code>lan-server.js</code>. Leave blank to use this site itself.</p>
+          <input id="lan-code" type="text" inputmode="numeric" maxlength="4" autocomplete="off" spellcheck="false"
+                 placeholder="Room code (optional, 4 digits)" />
+          <p class="relay-hint">Optional 4-digit code: only a player using the same code can join this room.</p>
         </div>
       </div>
 

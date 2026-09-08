@@ -31,6 +31,13 @@ const MP_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarke
 let landmarker = null;
 let lastTs = 0;
 
+// Reusable per-hand landmark pools — avoids allocating 21 objects per hand on
+// every inference (worker-thread GC pressure that can delay postMessage under
+// load). MediaPipe returns exactly 21 landmarks per hand; two pools cover the
+// numHands:2 cap. postMessage structured-clones these on send, so mutating the
+// pool for the next frame is always safe.
+const PT_POOL = [0, 1].map(() => Array.from({ length: 21 }, () => ({ x: 0, y: 0, z: 0 })));
+
 async function init() {
   const vision = await import(MP_BUNDLE);
   const fileset = await vision.FilesetResolver.forVisionTasks(MP_WASM);
@@ -75,6 +82,8 @@ self.onmessage = (e) => {
     const hands = [];
     const handed = [];
     let inferMs = 0;
+    let pts = null, nHands = 0;
+    let handNames = [];
     try {
       const t0 = performance.now();
       const res = landmarker.detectForVideo(bmp, ts);
@@ -84,8 +93,8 @@ self.onmessage = (e) => {
       const want = Math.min(msg.numHands || 2, 2);
       for (let hi = 0; hi < lms.length && hands.length < want; hi++) {
         const lm = lms[hi];
-        const out = new Array(lm.length);
-        for (let i = 0; i < lm.length; i++) out[i] = { x: lm[i].x, y: lm[i].y, z: lm[i].z || 0 };
+        const out = PT_POOL[hi % PT_POOL.length];
+        for (let i = 0; i < lm.length; i++) { out[i].x = lm[i].x; out[i].y = lm[i].y; out[i].z = lm[i].z || 0; }
         let hand = null;
         try {
           const h = rawHanded[hi] && rawHanded[hi][0];
@@ -93,9 +102,28 @@ self.onmessage = (e) => {
         } catch { hand = null; }
         hands.push({ pts: out, hand });
         handed.push(rawHanded[hi] || null);
+        handNames.push(hand);
       }
+      // Packed transfer: Float32Array (nHands*21*3) sent by transferable buffer.
+      try {
+        nHands = hands.length;
+        if (nHands > 0) {
+          pts = new Float32Array(nHands * 63);
+          for (let hi = 0; hi < nHands; hi++) {
+            const arr = hands[hi].pts;
+            for (let i = 0; i < 21 && i < arr.length; i++) {
+              const j = hi * 63 + i * 3;
+              pts[j] = arr[i].x; pts[j + 1] = arr[i].y; pts[j + 2] = arr[i].z || 0;
+            }
+          }
+        }
+      } catch { pts = null; }
     } catch { /* a bad frame must never kill the worker */ }
     if (bmp && bmp.close) bmp.close();
-    postMessage({ type: 'result', hands, handed, ts: msg.ts, roi: msg.roi || null, inferMs });
+    if (pts) {
+      postMessage({ type: 'result', hands, handed, pts, nHands, handNames, ts: msg.ts, roi: msg.roi || null, inferMs }, [pts.buffer]);
+    } else {
+      postMessage({ type: 'result', hands, handed, ts: msg.ts, roi: msg.roi || null, inferMs });
+    }
   }
 };

@@ -73,10 +73,10 @@ const TRACK_W_MIN = 192;
 const TRACK_W_MAX = 384;
 const TRACK_ASPECT = 3 / 4;                    // inference bitmap h = w * aspect (4:3 feed)
 const ROI_HALF = 0.30;                         // ROI half-size (fraction of frame) around last hand
-const INFER_MIN_MS = 50;                       // fastest inference send rate (~20fps; smoothing interpolates)
+const INFER_MIN_MS = 60;                       // fastest inference send rate (1/60Hz frame; smoothing interpolates)
 const INFER_MAX_MS = 140;                      // slowest when backed up
 const INFLIGHT_TIMEOUT_MS = 500;               // stuck snapshot watchdog (frees a dead transfer)
-const SYNC_FALLBACK_MS = 66;                   // main-thread detectForVideo cap (~15fps — it blocks render)
+const SYNC_FALLBACK_MS = 100;                  // main-thread detectForVideo cap (~10fps — it blocks render)
 const RTT_SLOW_MS = 70;                        // step resolution down above this
 const RTT_FAST_MS = 35;                        // step resolution up below this
 const RTT_SLOW_FRAMES = 30;
@@ -121,7 +121,7 @@ const ARM_SWITCH_MARGIN = 0.08;                // hysteresis when picking L/R wr
 // two-player, P2 takes the far rail (−z) — real opposite-ends play.
 const PADDLE_X_RANGE = 1.05;
 const PADDLE_Y_TOP = 1.62, PADDLE_Y_BOT = 0.82;
-const PADDLE_Z = 1.05;                         // near rail (P1 / the human in VS-AI)
+const PADDLE_Z = 1.30;                         // near rail (P1 / the human in VS-AI) — just inside the table edge
 const PADDLE_Z_FAR = -1.15;                    // far rail (P2 in two-player)
 const PADDLE_REACH = 0.32;                     // hit radius around the paddle
 
@@ -246,7 +246,7 @@ const state = {
   // far rail), ai.id='ai' (the bot). Scoring/HUD code never needs to know.
   player: { id: 'you', x: 0, y: 1.1, z: PADDLE_Z, railZ: PADDLE_Z, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.1, hitCooldown: 0 },
   p2:      { id: 'ai',  x: 0, y: 1.0, z: PADDLE_Z_FAR, railZ: PADDLE_Z_FAR, vx: 0, vy: 0, vz: 0, speed: 0, targetX: 0, targetY: 1.0, hitCooldown: 0 },
-  ai: { id: 'ai', x: 0, y: 1.0, z: -1.15, vx: 0, targetX: 0, targetY: 1.0, hitCooldown: 0, reactT: 0, aimErrX: 0, aimErrZ: 0 },
+  ai: { id: 'ai', x: 0, y: 1.0, z: -1.15, vx: 0, targetX: 0, targetY: 1.0, hitCooldown: 0, reactT: 0, aimErrX: 0, aimErrZ: 0, predAt: 0, predStamp: '' },
 
   // Hand tracking — one slot per player (slot 1 only used in 2p mode).
   // Gestures + calibration are P1-only (slot 0); slot 1 stays centroid.
@@ -264,6 +264,8 @@ const state = {
     frameEmaMs: 16.7, frameWorstMs: 0, slowFrameCount: 0,
     inflightResets: 0, syncRuns: 0,
     longtasks: 0, longtaskMaxMs: 0,
+    // Shadow map update throttling
+    frameCount: 0,
   },
 
   // P1 calibration state machine: idle | hold | swing | done | skipped.
@@ -333,7 +335,7 @@ function cacheDom() {
     'screen-intro', 'screen-setup', 'screen-error',
     'overlay-pause', 'overlay-gameover', 'toast',
     'mode-seg', 'mode-hint', 'difficulty-block', 'lan-note',
-    'relay-row', 'relay-input',
+    'relay-row', 'relay-input', 'lan-code',
     'difficulty-seg', 'btn-start', 'stat-wins', 'stat-losses', 'stat-rally',
     'pose-opt',
     'setup-status', 'setup-progress', 'setup-progress-bar',
@@ -1115,7 +1117,23 @@ function pumpTracking(nowMs) {
     const m = latestTracking;
     latestTracking = null;
     // Map ROI-crop coords back to full-frame video coords (in-place to avoid GC churn).
-    const hands = m.hands || [];
+    // Worker may send packed Float32Array (pts/nHands) — decode; legacy m.hands still accepted.
+    let hands;
+    if (m.pts instanceof Float32Array) {
+      const n = m.nHands | 0; hands = new Array(n);
+      const names = Array.isArray(m.handNames) ? m.handNames : null;
+      const leg = Array.isArray(m.hands) ? m.hands : null;
+      for (let hi = 0; hi < n; hi++) {
+        const base = hi * 63; const arr = new Array(21);
+        for (let i = 0; i < 21; i++) {
+          const j = base + i * 3;
+          arr[i] = { x: m.pts[j], y: m.pts[j + 1], z: m.pts[j + 2] };
+        }
+        let hn = names ? names[hi] : null;
+        if (hn == null && leg && leg[hi]) hn = (typeof leg[hi] === 'string') ? leg[hi] : (leg[hi].hand || null);
+        hands[hi] = { pts: arr, hand: hn };
+      }
+    } else { hands = m.hands || []; }
     const roi = m.roi || (m.ts === pendingTs ? pendingRoi : null);
     if (roi && hands.length) {
       const rx = roi.x, ry = roi.y, rw = roi.w, rh = roi.h;
@@ -1215,11 +1233,27 @@ function pumpTracking(nowMs) {
   }
 }
 
+let syncCanvas = null;
+function syncDetectSource() {
+  try {
+    if (!syncCanvas) {
+      syncCanvas = document.createElement('canvas');
+      syncCanvas.width = 160; syncCanvas.height = 120;
+    }
+    const c = syncCanvas.getContext('2d', { alpha: false });
+    c.drawImage(video, 0, 0, 160, 120);
+    return syncCanvas;
+  } catch { return video; }
+}
 function runSyncDetection(nowMs) {
   let result = null;
   try {
     trackTs = Math.max(trackTs + 1, Math.floor(performance.now()));
-    result = syncLandmarker.detectForVideo(video, trackTs);
+    try {
+      result = syncLandmarker.detectForVideo(syncDetectSource(), trackTs);
+    } catch {
+      result = syncLandmarker.detectForVideo(video, trackTs);
+    }
   } catch { return; }
   const hands = [];
   const lms = (result && result.landmarks) || [];
@@ -1632,17 +1666,41 @@ function makeStatic(obj) {
   obj.updateMatrix();
 }
 
+let contextLost = false;   // toggled by WebGL context-loss/restore handlers
+
 function initThree() {
   world.renderer = new THREE.WebGLRenderer({
     canvas: el.game,
-    antialias: true,
+    // MSAA is wasted once devicePixelRatio ≥ 2 (supersampling already smooths
+    // edges) — exactly the phones most likely to be GPU-bound.
+    antialias: window.devicePixelRatio < 2,
     powerPreference: 'high-performance',
   });
   world.renderer.shadowMap.enabled = true;
-  world.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  world.renderer.shadowMap.type = THREE.PCFShadowMap;
   world.renderer.shadowMap.autoUpdate = false;
-  world.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  world.renderer.toneMapping = THREE.ReinhardToneMapping;
   world.renderer.toneMappingExposure = 1.12;
+
+  // WebGL context loss (GPU reset / driver crash / laptop sleep-resume) would
+  // otherwise black-screen the canvas permanently with no recovery path.
+  // Pause the render loop on loss and rebuild renderer sizing on restore so
+  // play resumes instead of dying.
+  const glCanvas = world.renderer.domElement;
+  glCanvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();            // required so the context can be restored
+    contextLost = true;
+    try { toast('Graphics reset — restoring…'); } catch { /* ignore */ }
+  }, false);
+  glCanvas.addEventListener('webglcontextrestored', () => {
+    try {
+      layout();                    // re-applies size / DPR / FOV
+      world.renderer.shadowMap.needsUpdate = true;
+      world.renderer.shadowMap.autoUpdate = false;
+      contextLost = false;
+      toast('Graphics restored');
+    } catch { /* ignore */ }
+  }, false);
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x070b16);
@@ -1764,7 +1822,7 @@ function buildArena(scene) {
   const key = new THREE.DirectionalLight(0xfff2dd, 1.7);
   key.position.set(2.5, 5.5, 3.5);
   key.castShadow = true;
-  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.mapSize.set(512, 512);
   key.shadow.camera.left = -3; key.shadow.camera.right = 3;
   key.shadow.camera.top = 3; key.shadow.camera.bottom = -3;
   key.shadow.camera.near = 1; key.shadow.camera.far = 12;
@@ -2250,13 +2308,14 @@ function stepBall(dt, scoring) {
   if (!b.visible) return;
 
   const speed = Math.hypot(b.vx, b.vy, b.vz);
-  const steps = Math.max(1, Math.ceil(speed * dt / (BALL_R * 0.8)));
+  const steps = Math.min(4, Math.max(1, Math.ceil(speed * dt / (BALL_R * 0.8))));
   const sdt = dt / steps;
+  const gs = GRAVITY * sdt;
 
   for (let i = 0; i < steps; i++) {
     const prevZ = b.z;
 
-    b.vy -= GRAVITY * sdt;
+    b.vy -= gs;
     b.x += b.vx * sdt;
     b.y += b.vy * sdt;
     b.z += b.vz * sdt;
@@ -2436,17 +2495,22 @@ function stepAI(dt) {
   const incoming = state.phase === 'rally' && b.lastHitter === 'you' && b.vz < 0 && b.visible;
 
   if (incoming && ai.reactT <= 0) {
-    // Predict where the ball arrives at the AI's rail (z = -1.15).
-    const tArr = (b.z - ai.z) / -b.vz;
-    if (tArr > 0 && tArr < 2.2) {
-      let predX = b.x + b.vx * tArr;
-      let predY = b.y + b.vy * tArr - 0.5 * GRAVITY * tArr * tArr;
-      // If it arrives below the table, aim for the post-bounce rise instead.
-      if (predY < TABLE.H + 0.05) predY = TABLE.H + 0.12;
-      ai.targetX = clampNum(predX, -PADDLE_X_RANGE, PADDLE_X_RANGE);
-      ai.targetY = clampNum(predY, 0.86, 1.5);
-    } else {
-      ai.targetX = 0; ai.targetY = 1.0;
+    const stamp = b.lastHitter + '|' + b.bounces + '|' + state.rally;
+    const nowMs = performance.now();
+    if (stamp !== ai.predStamp || nowMs - ai.predAt > 120) {
+      ai.predStamp = stamp; ai.predAt = nowMs;
+      // Predict where the ball arrives at the AI's rail (z = -1.15).
+      const tArr = (b.z - ai.z) / -b.vz;
+      if (tArr > 0 && tArr < 2.2) {
+        let predX = b.x + b.vx * tArr;
+        let predY = b.y + b.vy * tArr - 0.5 * GRAVITY * tArr * tArr;
+        // If it arrives below the table, aim for the post-bounce rise instead.
+        if (predY < TABLE.H + 0.05) predY = TABLE.H + 0.12;
+        ai.targetX = clampNum(predX, -PADDLE_X_RANGE, PADDLE_X_RANGE);
+        ai.targetY = clampNum(predY, 0.86, 1.5);
+      } else {
+        ai.targetX = 0; ai.targetY = 1.0;
+      }
     }
   } else if (!incoming) {
     // Drift toward center, shading toward the ball's x.
@@ -2606,7 +2670,9 @@ function renderScene(dt) {
   // LAN: each device renders ONE full-screen POV — its own.
   const r = world.renderer;
   if (r.shadowMap.enabled && !state.paused) {
-    r.shadowMap.needsUpdate = true;
+    // Update shadows at 30Hz max to reduce GPU load
+    state.perf.frameCount++;
+    if (state.perf.frameCount % 2 === 0) r.shadowMap.needsUpdate = true;
   }
   const fullAspect = view.w / view.h;
   if (isLan() && world.camera2) {
@@ -2869,10 +2935,28 @@ function toast(msg) {
 let audioCtx = null;
 const BLIP_AMBIENT_GAP = 50;               // min ms between physics-noise blips (node churn)
 
+// Sound node pooling to reduce GC pressure
+const SOUND_POOL_SIZE = 8;
+let soundPool = [];
+let poolIndex = 0;
+
 function ensureAudio() {
   if (!state.sound) return null;
   try {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // Continuous-voice pool: oscillators run forever at zero gain;
+      // playTone only shapes the gain envelope — never start()/stop().
+      soundPool = [];
+      for (let i = 0; i < SOUND_POOL_SIZE; i++) {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        g.gain.value = 0;
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start();
+        soundPool.push({ osc: o, gain: g });
+      }
+    }
     if (audioCtx.state === 'suspended') audioCtx.resume();
     return audioCtx;
   } catch { return null; }
@@ -2899,17 +2983,18 @@ function blip(freq, dur = 0.06, type = 'sine', gain = 0.05, minGap = 0) {
 
 function playTone(freq, dur, type, gain) {
   const ac = ensureAudio();
-  if (!ac) return;
-  const o = ac.createOscillator();
-  const g = ac.createGain();
-  o.type = type;
-  o.frequency.value = freq;
-  g.gain.setValueAtTime(gain, ac.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
-  o.connect(g);
-  g.connect(ac.destination);
-  o.start();
-  o.stop(ac.currentTime + dur + 0.02);
+  if (!ac || !soundPool.length) return;
+  const v = soundPool[poolIndex];
+  poolIndex = (poolIndex + 1) % SOUND_POOL_SIZE;
+  try {
+    const t = ac.currentTime;
+    v.osc.type = type;
+    v.osc.frequency.setValueAtTime(freq, t);
+    const g = v.gain.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(Math.max(0.0001, gain), t);
+    g.exponentialRampToValueAtTime(0.0001, t + Math.max(0.01, dur));
+  } catch { /* sound must never break gameplay */ }
 }
 
 function syncSoundBtn() {
@@ -2928,50 +3013,46 @@ function toggleSound() {
    18. CONFETTI
    ============================================================ */
 
-let confettiParts = [];
+const MAX_CONFETTI = 150;
+const CONFETTI_COLORS = ['#35e08c', '#4dd7ff', '#ffd166', '#ff5d73', '#eef3ff'];
+const confettiParts = [];
+for (let i = 0; i < MAX_CONFETTI; i++) {
+  confettiParts.push({ x: 0, y: 0, vx: 0, vy: 0, w: 0, h: 0, rot: 0, vr: 0, color: '#000000' });
+}
 let confettiUntil = 0;
+let confettiActive = false;
 
 function spawnConfetti() {
   if (REDUCED_MOTION) return;
-  const colors = ['#35e08c', '#4dd7ff', '#ffd166', '#ff5d73', '#eef3ff'];
-  confettiParts = [];
-  for (let i = 0; i < 150; i++) {
-    confettiParts.push({
-      x: view.w / 2 + (Math.random() - 0.5) * view.w * 0.5,
-      y: view.h * 0.25 + (Math.random() - 0.5) * 60,
-      vx: (Math.random() - 0.5) * 420,
-      vy: -Math.random() * 380 - 60,
-      w: 5 + Math.random() * 6,
-      h: 8 + Math.random() * 8,
-      rot: Math.random() * Math.PI,
-      vr: (Math.random() - 0.5) * 10,
-      color: colors[i % colors.length],
-    });
+  for (let i = 0; i < MAX_CONFETTI; i++) {
+    const p = confettiParts[i];
+    p.x = view.w / 2 + (Math.random() - 0.5) * view.w * 0.5;
+    p.y = view.h * 0.25 + (Math.random() - 0.5) * 60;
+    p.vx = (Math.random() - 0.5) * 420;
+    p.vy = -Math.random() * 380 - 60;
+    p.w = 5 + Math.random() * 6;
+    p.h = 8 + Math.random() * 8;
+    p.rot = Math.random() * Math.PI;
+    p.vr = (Math.random() - 0.5) * 10;
+    p.color = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
   }
   confettiUntil = performance.now() + 2800;
+  confettiActive = true;
 }
 
 function stepConfetti(dt) {
-  if (confettiParts.length === 0) return;
-  const cc = confettiCtx;
-  cc.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  if (!confettiActive) return;
+  const cc = confettiCtx, d = view.dpr;
+  cc.setTransform(d, 0, 0, d, 0, 0);
   cc.clearRect(0, 0, view.w, view.h);
-  if (performance.now() > confettiUntil) {
-    confettiParts = [];
-    return;
-  }
-  for (let i = 0; i < confettiParts.length; i++) {
+  if (performance.now() > confettiUntil) { confettiActive = false; return; }
+  for (let i = 0; i < MAX_CONFETTI; i++) {
     const p = confettiParts[i];
-    p.vy += 900 * dt;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.rot += p.vr * dt;
-    cc.save();
-    cc.translate(p.x, p.y);
-    cc.rotate(p.rot);
+    p.vy += 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+    const c = Math.cos(p.rot) * d, s = Math.sin(p.rot) * d;
+    cc.setTransform(c, s, -s, c, p.x * d, p.y * d);
     cc.fillStyle = p.color;
     cc.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
-    cc.restore();
   }
 }
 
@@ -3050,6 +3131,22 @@ function wireControls() {
       toast(norm ? `Relay saved — ${relayLabel()}` : 'Using this site as the relay');
     }
   });
+  // Optional private room code (appended to the WebSocket URL; the server
+  // rejects a second peer whose code doesn't match the first peer's code).
+  if (el['lan-code']) {
+    el['lan-code'].addEventListener('change', () => {
+      try {
+        const v = (el['lan-code'].value || '').trim().slice(0, 4);
+        el['lan-code'].value = v;
+        if (v) localStorage.setItem(LAN_CODE_KEY, v);
+        else localStorage.removeItem(LAN_CODE_KEY);
+      } catch { /* storage may be unavailable */ }
+      if (state.lan.ws && state.screen === 'setup') {   // reconnect with the new code
+        lanTeardown();
+        lanBeginSetup();
+      }
+    });
+  }
   for (const btn of el['difficulty-seg'].querySelectorAll('button')) {
     btn.addEventListener('click', () => setDifficulty(btn.dataset.diff));
   }
@@ -3274,9 +3371,38 @@ function getPerf() {
   };
 }
 
+let shadowDowngraded = false;     // one-way (with hysteresis) quality drop
+let slowWindowStart = 0;
+
+function maybeDowngradeShadows(ts) {
+  // Uses the existing frame-pacing telemetry (state.perf.frameEmaMs). If the
+  // EMA stays elevated (>28ms) for ~3s, disable the shadow map once — the
+  // single most expensive setting on the table — then re-enable if frames
+  // recover below 20ms (hysteresis avoids oscillation).
+  if (shadowDowngraded) {
+    if (state.perf.frameEmaMs < 20 && world.renderer) {
+      shadowDowngraded = false;
+      try { world.renderer.shadowMap.enabled = true; world.renderer.shadowMap.needsUpdate = true; } catch { /* ignore */ }
+    }
+    return;
+  }
+  if (state.perf.frameEmaMs > 28) {
+    if (!slowWindowStart) slowWindowStart = ts;
+    else if (ts - slowWindowStart > 3000) {
+      shadowDowngraded = true;
+      try { world.renderer.shadowMap.enabled = false; world.renderer.shadowMap.needsUpdate = true; } catch { /* ignore */ }
+      if (PERF_OVERLAY) console.log('[airsmash] shadows disabled (sustained slow frames)');
+    }
+  } else {
+    slowWindowStart = 0;
+  }
+}
+
 function frame(ts) {
+  if (contextLost) { requestAnimationFrame(frame); return; }   // loop paused; resume on restore
   const dt = Math.min(0.05, lastTs ? (ts - lastTs) / 1000 : 0.016);
   noteFramePacing(ts);
+  maybeDowngradeShadows(ts);
   lastTs = ts;
   update(dt, ts);
   renderScene(dt);
@@ -3307,6 +3433,7 @@ function frame(ts) {
    ws(s):// URLs; a missing path gets '/ws' appended. */
 
 const RELAY_KEY = 'airsmash.relay.v1';
+const LAN_CODE_KEY = 'airsmash.lanCode.v1';
 
 function normalizeRelayUrl(raw) {
   const v = String(raw || '').trim();
@@ -3361,8 +3488,10 @@ function lanConnect() {
   if (state.lan.ws && (state.lan.ws.readyState === 0 || state.lan.ws.readyState === 1)) return;
   let ws;
   try {
-    const url = state.lan.relayUrl
+    let url = state.lan.relayUrl
       || ((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    const code = ((el['lan-code'] && el['lan-code'].value) || '').trim();
+    if (code) url += (url.includes('?') ? '&' : '?') + 'code=' + encodeURIComponent(code);
     ws = new WebSocket(url);
   } catch {
     lanUnavailable();
@@ -3430,7 +3559,10 @@ function lanBeginSetup() {
   el['lan-note'].classList.remove('hidden');
   state.lan.peerReady = false;
   state.lan.lastReadySent = null;
-  lanUpdateNote(`Connecting to the relay (${relayLabel()})…`);
+  const code = ((el['lan-code'] && el['lan-code'].value) || '').trim();
+  lanUpdateNote(code
+    ? `Connecting to the relay (${relayLabel()}) — private room code ${code}…`
+    : `Connecting to the relay (${relayLabel()}) — open room (anyone can join)…`);
   lanConnect();
 }
 
@@ -3796,6 +3928,25 @@ window.__airsmash = {
   },
   // Send a raw LAN protocol message (used by tests to simulate a peer).
   lanSend,
+  // Force a WebGL context loss / restore (testing only). Uses the
+  // WEBGL_lose_context extension; returns true if the extension is available
+  // so callers can skip gracefully where it isn't (e.g. some headless GPUs).
+  forceContextLoss() {
+    try {
+      const ext = world.renderer.getContext().getExtension('WEBGL_lose_context');
+      if (!ext) return false;
+      ext.loseContext();
+      return true;
+    } catch { return false; }
+  },
+  restoreContext() {
+    try {
+      const ext = world.renderer.getContext().getExtension('WEBGL_lose_context');
+      if (!ext) return false;
+      ext.restoreContext();
+      return true;
+    } catch { return false; }
+  },
 };
 
 /* ============================================================
@@ -3806,6 +3957,7 @@ document.addEventListener('DOMContentLoaded', () => {
   cacheDom();
   state.lan.relayUrl = resolveRelayUrl();
   if (el['relay-input'] && state.lan.relayUrl) el['relay-input'].value = state.lan.relayUrl;
+  try { if (el['lan-code']) el['lan-code'].value = localStorage.getItem(LAN_CODE_KEY) || ''; } catch { /* ignore */ }
   try { if (el['pose-opt']) el['pose-opt'].checked = loadPoseOpt(); } catch { /* ignore */ }
   previewCtx = el.preview.getContext('2d');
   confettiCtx = el.confetti.getContext('2d');

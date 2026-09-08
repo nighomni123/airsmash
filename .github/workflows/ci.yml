@@ -1,0 +1,19 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npx playwright@1.45.1 install --with-deps chromium
+      - run: node --check app.js
+      - run: node verify.js
+      # Optional (not a gate): run `node capture.js` to regenerate
+      # screenshots only when visuals change.
